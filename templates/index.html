@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Biometric Face Recognition</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <div class="background-shapes">
+        <div class="shape shape-1"></div>
+        <div class="shape shape-2"></div>
+        <div class="shape shape-3"></div>
+    </div>
+
+    <main class="container">
+        <header class="header glass-panel">
+            <div class="header-content">
+                <div class="logo">
+                    <svg viewBox="0 0 24 24" width="32" height="32" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" class="icon"><path d="M3 7V5a2 2 0 0 1 2-2h2"></path><path d="M17 3h2a2 2 0 0 1 2 2v2"></path><path d="M21 17v2a2 2 0 0 1-2 2h-2"></path><path d="M7 21H5a2 2 0 0 1-2-2v-2"></path><path d="M8 14s1.5 2 4 2 4-2 4-2"></path><line x1="9" y1="9" x2="9.01" y2="9"></line><line x1="15" y1="9" x2="15.01" y2="9"></line></svg>
+                    <h1>Biometric Face Recognition</h1>
+                </div>
+                <p>ORL/AT&T Dataset • PCA vs LBP Evaluation</p>
+            </div>
+            <button id="startBtn" class="btn primary-btn">
+                <span class="btn-text">Start Evaluation</span>
+                <span class="loader hidden"></span>
+            </button>
+        </header>
+
+        <div id="loadingState" class="loading-container hidden">
+            <div class="spinner"></div>
+            <p>Processing images and extracting features... This may take a few seconds.</p>
+        </div>
+
+        <div id="resultsContainer" class="results-grid hidden">
+            <!-- PCA Metrics Card -->
+            <div class="metric-card glass-panel fade-in delay-1">
+                <div class="card-header">
+                    <h2>PCA (Eigenfaces)</h2>
+                    <span class="badge blue">Primary</span>
+                </div>
+                <div class="stats-grid" id="pcaStats">
+                    <!-- Dynamic stats will go here -->
+                </div>
+            </div>
+
+            <!-- LBP Metrics Card -->
+            <div class="metric-card glass-panel fade-in delay-2">
+                <div class="card-header">
+                    <h2>LBP (Local Binary Patterns)</h2>
+                    <span class="badge orange">Secondary</span>
+                </div>
+                <div class="stats-grid" id="lbpStats">
+                    <!-- Dynamic stats will go here -->
+                </div>
+            </div>
+
+            <!-- Plot Card -->
+            <div class="plot-card glass-panel fade-in delay-3">
+                <div class="card-header">
+                    <h2>Distributions & ROC Curve</h2>
+                </div>
+                <div class="plot-image-container">
+                    <img id="resultsPlot" src="" alt="Results Plot" class="hidden">
+                    <div id="plotPlaceholder" class="placeholder">
+                        Plot will appear here after evaluation
+                    </div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <script src="{{ url_for('static', filename='js/script.js') }}"></script>
+</body>
+</html>
