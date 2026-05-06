@@ -3,264 +3,402 @@
   Biometric Face Recognition System
   Dataset  : ORL/AT&T (Olivetti Faces) – 40 subjects, 10 imgs each
   Methods  : PCA (Eigenfaces)  &  LBP (Local Binary Patterns)
-  Author   : Generated Project
 =============================================================
+
+DESIGN NOTES
+------------
+PCA  – holistic / appearance-based method.
+       Known weakness  : sensitive to illumination variation.
+       Mitigation      : histogram-equalisation pre-processing
+                         + PCA fitted ONLY on enroll set (no data leakage).
+
+LBP  – texture / local-feature method.
+       Uses relative pixel comparisons → inherently illumination-robust.
+       Vectorised NumPy implementation (~100× faster than pixel loops).
 """
 
 import os
+import cv2
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from pathlib import Path
 from sklearn.decomposition import PCA
-from sklearn.preprocessing import normalize
 from sklearn.metrics import roc_curve, auc
-from skimage.feature import local_binary_pattern
 from scipy.interpolate import interp1d
 import warnings
 warnings.filterwarnings('ignore')
 
-def preprocess(imgs):
-    """Flatten → zero-mean / unit-variance normalisation per image."""
-    flat = imgs.reshape(len(imgs), -1).astype(np.float64)
-    mu   = flat.mean(axis=1, keepdims=True)
-    sig  = flat.std(axis=1,  keepdims=True) + 1e-8
-    return (flat - mu) / sig
 
-def extract_lbp(imgs, radius=2, n_points=16):
-    feats = []
-    for img in imgs:
-        lbp  = local_binary_pattern(img, n_points, radius, method='uniform')
-        hist, _ = np.histogram(lbp.ravel(),
-                               bins=n_points + 2,
-                               range=(0, n_points + 2),
-                               density=True)
-        feats.append(hist)
-    return np.array(feats)
+# =========================================================
+# LOAD DATASET  (reads .pgm files directly)
+# =========================================================
+def load_dataset(path, size=(100, 100)):
+    images, labels = [], []
+    for label_id, person_dir in enumerate(sorted(Path(path).iterdir())):
+        if not person_dir.is_dir():
+            continue
+        for img_path in sorted(person_dir.glob("*.pgm")):
+            img = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                continue
+            images.append(cv2.resize(img, size))
+            labels.append(label_id)
+    return np.array(images), np.array(labels)
 
-def cosine_sim(a, b):
-    return normalize(a) @ normalize(b).T   # (|a|, |b|)
 
-def get_scores(tr_feats, te_feats, tr_lbl, te_lbl):
-    sim = cosine_sim(te_feats, tr_feats)
-    gen, imp = [], []
-    for i, tl in enumerate(te_lbl):
-        for j, rl in enumerate(tr_lbl):
-            (gen if tl == rl else imp).append(sim[i, j])
-    return np.array(gen), np.array(imp)
+# =========================================================
+# PREPROCESSING — Histogram Equalisation
+# Brings PCA closer to LBP's illumination robustness.
+# =========================================================
+def preprocess(img):
+    return cv2.equalizeHist(img)
 
-def compute_metrics(gen, imp, name):
-    # D-prime
-    mu_g, mu_i = gen.mean(), imp.mean()
-    sg,   si   = gen.std(),  imp.std()
-    d_prime    = abs(mu_g - mu_i) / np.sqrt(0.5 * (sg**2 + si**2))
 
-    # ROC
-    scores = np.concatenate([gen, imp])
-    y_true = np.concatenate([np.ones(len(gen)), np.zeros(len(imp))])
+# =========================================================
+# LBP FEATURE — Vectorised NumPy (~100x faster than loops)
+# =========================================================
+def lbp(img):
+    c = img[1:-1, 1:-1]
+    code = (
+        ((img[0:-2, 0:-2] > c) << 7) |
+        ((img[0:-2, 1:-1] > c) << 6) |
+        ((img[0:-2, 2:]   > c) << 5) |
+        ((img[1:-1, 2:]   > c) << 4) |
+        ((img[2:,   2:]   > c) << 3) |
+        ((img[2:,   1:-1] > c) << 2) |
+        ((img[2:,   0:-2] > c) << 1) |
+        ((img[1:-1, 0:-2] > c))
+    )
+    hist, _ = np.histogram(code.ravel(), bins=256, range=(0, 256))
+    return hist / (np.sum(hist) + 1e-10)
+
+
+# =========================================================
+# SIMILARITY
+# =========================================================
+def similarity(x, y):
+    return np.dot(x, y) / (np.linalg.norm(x) * np.linalg.norm(y) + 1e-10)
+
+
+# =========================================================
+# TRAIN / TEST SPLIT — 80% enroll, 20% probe (per subject)
+# =========================================================
+def split_dataset(images, labels):
+    labels = np.array(labels)
+    enroll_idx, probe_idx = [], []
+    for s in np.unique(labels):
+        idx   = np.where(labels == s)[0]
+        split = max(1, int(0.8 * len(idx)))
+        enroll_idx.extend(idx[:split].tolist())
+        probe_idx.extend(idx[split:].tolist())
+    return np.array(enroll_idx), np.array(probe_idx)
+
+
+# =========================================================
+# GEN-IMP SCORES  (uses separate enroll / probe sets)
+# =========================================================
+def gen_imp_scores(FM, labels, enroll_idx, probe_idx):
+    Gen, Imp = [], []
+    labels     = np.array(labels)
+    enroll_lbl = labels[enroll_idx]
+    probe_lbl  = labels[probe_idx]
+    unique     = np.unique(labels)
+
+    for s in unique:
+        e_idx  = enroll_idx[enroll_lbl == s]
+        p_idx  = probe_idx[probe_lbl  == s]
+        if len(e_idx) == 0 or len(p_idx) == 0:
+            continue
+        # Genuine
+        for i in e_idx:
+            for j in p_idx:
+                Gen.append(similarity(FM[i], FM[j]))
+        # Impostor
+        for s2 in unique:
+            if s2 == s:
+                continue
+            p2_idx = probe_idx[probe_lbl == s2]
+            for i in e_idx:
+                for j in p2_idx:
+                    Imp.append(similarity(FM[i], FM[j]))
+
+    return np.array(Gen), np.array(Imp)
+
+
+# =========================================================
+# METRICS
+# =========================================================
+def compute_metrics(Gen, Imp):
+    scores = np.concatenate([Gen, Imp])
+    y_true = np.concatenate([np.ones(len(Gen)), np.zeros(len(Imp))])
+
     fpr, tpr, thresholds = roc_curve(y_true, scores)
-    roc_auc = auc(fpr, tpr)
+    roc_auc = float(auc(fpr, tpr))
 
-    # EER  (where FPR ≈ FNR)
     fnr     = 1 - tpr
-    idx     = np.argmin(np.abs(fpr - fnr))
-    eer     = (fpr[idx] + fnr[idx]) / 2
-    eer_thr = thresholds[idx]
+    idx     = np.argmin(np.abs(fnr - fpr))
+    eer     = float(fpr[idx])
+    eer_thr = float(thresholds[idx])
 
-    # TMR at FMR = 1%  and  FMR = 0.01%
-    f_tpr = interp1d(fpr, tpr, bounds_error=False, fill_value=(0.0, 1.0))
+    # Interpolated TMR at fixed FMR operating points
+    f_tpr   = interp1d(fpr, tpr, bounds_error=False, fill_value=(0.0, 1.0))
     tmr_1   = float(f_tpr(0.01))
     tmr_001 = float(f_tpr(0.0001))
 
-    return dict(fpr=fpr.tolist(), tpr=tpr.tolist(), auc=float(roc_auc),
-                d_prime=float(d_prime), eer=float(eer), eer_thr=float(eer_thr),
-                tmr_1=float(tmr_1), tmr_001=float(tmr_001))
+    dp = float(
+        abs(np.mean(Gen) - np.mean(Imp)) /
+        (np.sqrt(0.5 * (np.std(Gen)**2 + np.std(Imp)**2)) + 1e-10)
+    )
 
-def identification(tr_feats, te_feats, tr_lbl, te_lbl, threshold, name):
-    sim   = cosine_sim(te_feats, tr_feats)   # (n_test, n_train)
-    total = len(te_lbl)
-
-    rank1  = 0
-    tp = fp = fn = 0
-
-    for i, true_lbl in enumerate(te_lbl):
-        row            = sim[i]
-        best_idx       = int(np.argmax(row))
-        best_score     = row[best_idx]
-        predicted_lbl  = tr_lbl[best_idx]
-
-        if predicted_lbl == true_lbl:
-            rank1 += 1
-
-        if best_score >= threshold:          # system ACCEPTS
-            if predicted_lbl == true_lbl:
-                tp += 1
-            else:
-                fp += 1
-        else:                                # system REJECTS
-            fn += 1
-
-    rank1_acc = rank1 / total
-    fpir      = fp   / total
-    fnir      = fn   / total
-
-    return float(rank1_acc), float(fpir), float(fnir)
+    return dict(
+        fpr=fpr, tpr=tpr,
+        auc=roc_auc,
+        eer=eer, eer_thr=eer_thr,
+        d_prime=dp,
+        tmr_1=tmr_1, tmr_001=tmr_001,
+    )
 
 
-def run_pipeline():
-    images = np.load('faces_images.npy')   
-    labels = np.load('faces_labels.npy')   
+# =========================================================
+# RANK-1 — Vectorised (no Python loops, no self-match)
+# =========================================================
+def rank1_acc(FM, labels, enroll_idx, probe_idx):
+    labels = np.array(labels)
+    FM_e   = FM[enroll_idx]
+    FM_p   = FM[probe_idx]
+    norm_e = FM_e / (np.linalg.norm(FM_e, axis=1, keepdims=True) + 1e-10)
+    norm_p = FM_p / (np.linalg.norm(FM_p, axis=1, keepdims=True) + 1e-10)
+    sim_matrix  = norm_p @ norm_e.T
+    pred_labels = labels[enroll_idx[np.argmax(sim_matrix, axis=1)]]
+    return float(np.mean(pred_labels == labels[probe_idx]))
 
-    N_SUBJECTS      = 40
-    N_PER_SUBJECT   = 10
 
-    train_imgs, train_lbl = [], []
-    test_imgs,  test_lbl  = [], []
+# =========================================================
+# FPIR / FNIR at EER threshold — Vectorised
+# =========================================================
+def fpir_fnir(FM, labels, enroll_idx, probe_idx, threshold):
+    labels     = np.array(labels)
+    enroll_lbl = labels[enroll_idx]
+    probe_lbl  = labels[probe_idx]
 
-    for s in range(N_SUBJECTS):
-        subj_imgs = images[labels == s]          
-        n_train   = int(0.8 * N_PER_SUBJECT)    
-        train_imgs.extend(subj_imgs[:n_train])
-        train_lbl.extend([s] * n_train)
-        test_imgs.extend(subj_imgs[n_train:])   
-        test_lbl.extend([s] * (N_PER_SUBJECT - n_train))
+    FM_e   = FM[enroll_idx]
+    FM_p   = FM[probe_idx]
+    norm_e = FM_e / (np.linalg.norm(FM_e, axis=1, keepdims=True) + 1e-10)
+    norm_p = FM_p / (np.linalg.norm(FM_p, axis=1, keepdims=True) + 1e-10)
+    sim    = norm_p @ norm_e.T
 
-    train_imgs = np.array(train_imgs)           
-    train_lbl  = np.array(train_lbl)
-    test_imgs  = np.array(test_imgs)            
-    test_lbl   = np.array(test_lbl)
+    best_idx = np.argmax(sim, axis=1)
+    best_scr = sim[np.arange(len(probe_idx)), best_idx]
+    pred_lbl = enroll_lbl[best_idx]
 
-    train_flat = preprocess(train_imgs)
-    test_flat  = preprocess(test_imgs)
+    correct  = pred_lbl == probe_lbl
+    accepted = best_scr >= threshold
 
-    N_COMPONENTS = 100
-    pca       = PCA(n_components=N_COMPONENTS, whiten=True, random_state=42)
-    train_pca = pca.fit_transform(train_flat)
-    test_pca  = pca.transform(test_flat)
+    fpir = float((accepted & ~correct).sum() / len(probe_lbl))
+    fnir = float((~accepted).sum()           / len(probe_lbl))
+    return fpir, fnir
 
-    train_lbp = extract_lbp(train_imgs)
-    test_lbp  = extract_lbp(test_imgs)
 
-    gen_pca, imp_pca = get_scores(train_pca, test_pca, train_lbl, test_lbl)
-    gen_lbp, imp_lbp = get_scores(train_lbp, test_lbp, train_lbl, test_lbl)
+# =========================================================
+# MAIN PIPELINE
+# =========================================================
+def run_pipeline(dataset_path="dataset"):
+    print("Loading dataset...")
+    images_raw, labels = load_dataset(dataset_path)
+    print(f"  Loaded {len(images_raw)} images from {len(np.unique(labels))} subjects")
 
-    res_pca = compute_metrics(gen_pca, imp_pca, "PCA")
-    res_lbp = compute_metrics(gen_lbp, imp_lbp, "LBP")
+    # Histogram equalisation
+    print("Preprocessing (histogram equalisation)...")
+    images = np.array([preprocess(img) for img in images_raw])
 
-    r1_pca, fpir_pca, fnir_pca = identification(
-        train_pca, test_pca, train_lbl, test_lbl,
-        res_pca['eer_thr'], "PCA")
+    # 80 / 20 split
+    enroll_idx, probe_idx = split_dataset(images, labels)
+    print(f"  Enroll: {len(enroll_idx)} | Probe: {len(probe_idx)}")
 
-    r1_lbp, fpir_lbp, fnir_lbp = identification(
-        train_lbp, test_lbp, train_lbl, test_lbl,
-        res_lbp['eer_thr'], "LBP")
-        
-    res_pca['rank1'] = r1_pca
-    res_pca['fpir'] = fpir_pca
-    res_pca['fnir'] = fnir_pca
-    
-    res_lbp['rank1'] = r1_lbp
-    res_lbp['fpir'] = fpir_lbp
-    res_lbp['fnir'] = fnir_lbp
+    # ----------------------------------------------------------
+    # METHOD 1 — PCA (Eigenfaces)
+    # PCA fitted ONLY on enroll set → no data leakage into probe.
+    # ----------------------------------------------------------
+    print("\nRunning PCA (Eigenfaces)...")
+    X_all    = images.reshape(len(images), -1).astype(np.float32)
+    X_enroll = X_all[enroll_idx]
 
-    # Plots
-    fig, axes = plt.subplots(2, 2, figsize=(14, 11))
-    fig.suptitle('Biometric Face Recognition – ORL/AT&T Dataset\nPCA vs LBP', fontsize=14, fontweight='bold', y=1.01)
+    pca    = PCA(n_components=min(50, len(enroll_idx) - 1))
+    pca.fit(X_enroll)
+    FM_pca = pca.transform(X_all)
 
-    # ── Gen/Imp – PCA 
-    ax = axes[0, 0]
-    ax.hist(imp_pca, bins=80, alpha=0.65, color='#e74c3c', density=True, label='Impostor')
-    ax.hist(gen_pca, bins=80, alpha=0.65, color='#27ae60', density=True, label='Genuine')
-    ax.set_title('Genuine / Impostor Distribution – PCA', fontsize=11)
-    ax.set_xlabel('Cosine Similarity Score')
-    ax.set_ylabel('Density')
-    ax.legend(); ax.grid(alpha=0.3)
+    Gen_pca, Imp_pca   = gen_imp_scores(FM_pca, labels, enroll_idx, probe_idx)
+    res_pca            = compute_metrics(Gen_pca, Imp_pca)
+    r1_pca             = rank1_acc(FM_pca, labels, enroll_idx, probe_idx)
+    fpir_pca, fnir_pca = fpir_fnir(FM_pca, labels, enroll_idx, probe_idx, res_pca['eer_thr'])
+    res_pca.update(rank1=r1_pca, fpir=fpir_pca, fnir=fnir_pca)
 
-    # ── Gen/Imp – LBP
-    ax = axes[0, 1]
-    ax.hist(imp_lbp, bins=80, alpha=0.65, color='#e74c3c', density=True, label='Impostor')
-    ax.hist(gen_lbp, bins=80, alpha=0.65, color='#27ae60', density=True, label='Genuine')
-    ax.set_title('Genuine / Impostor Distribution – LBP', fontsize=11)
-    ax.set_xlabel('Cosine Similarity Score')
-    ax.set_ylabel('Density')
-    ax.legend(); ax.grid(alpha=0.3)
+    print(f"  EER={res_pca['eer']:.4f}  d'={res_pca['d_prime']:.4f}"
+          f"  Rank-1={r1_pca:.4f}  AUC={res_pca['auc']:.4f}")
+    print(f"  TMR@FMR=1%={res_pca['tmr_1']:.4f}  TMR@FMR=0.01%={res_pca['tmr_001']:.4f}")
 
-    # ── ROC Curve
-    ax = axes[1, 0]
-    ax.plot(res_pca['fpr'], res_pca['tpr'], color='#2980b9', lw=2,
-            label=f"PCA  AUC={res_pca['auc']:.3f}  EER={res_pca['eer']*100:.1f}%")
-    ax.plot(res_lbp['fpr'], res_lbp['tpr'], color='#e67e22', lw=2, ls='--',
-            label=f"LBP  AUC={res_lbp['auc']:.3f}  EER={res_lbp['eer']*100:.1f}%")
-    ax.plot([0, 1], [0, 1], 'k--', alpha=0.25)
-    ax.set_xlim([0, 1]); ax.set_ylim([0, 1])
-    ax.set_xlabel('FMR  (False Match Rate)')
-    ax.set_ylabel('TMR  (True Match Rate = 1 – FRR)')
-    ax.set_title('ROC Curve', fontsize=11)
-    ax.legend(loc='lower right', fontsize=9); ax.grid(alpha=0.3)
+    # ----------------------------------------------------------
+    # METHOD 2 — LBP (Local Binary Patterns)
+    # Relative pixel comparisons → illumination-robust by design.
+    # ----------------------------------------------------------
+    print("\nRunning LBP...")
+    FM_lbp = np.array([lbp(img) for img in images])
 
-    # ── Metrics Table
-    ax = axes[1, 1]
-    ax.axis('off')
+    Gen_lbp, Imp_lbp   = gen_imp_scores(FM_lbp, labels, enroll_idx, probe_idx)
+    res_lbp            = compute_metrics(Gen_lbp, Imp_lbp)
+    r1_lbp             = rank1_acc(FM_lbp, labels, enroll_idx, probe_idx)
+    fpir_lbp, fnir_lbp = fpir_fnir(FM_lbp, labels, enroll_idx, probe_idx, res_lbp['eer_thr'])
+    res_lbp.update(rank1=r1_lbp, fpir=fpir_lbp, fnir=fnir_lbp)
+
+    print(f"  EER={res_lbp['eer']:.4f}  d'={res_lbp['d_prime']:.4f}"
+          f"  Rank-1={r1_lbp:.4f}  AUC={res_lbp['auc']:.4f}")
+    print(f"  TMR@FMR=1%={res_lbp['tmr_1']:.4f}  TMR@FMR=0.01%={res_lbp['tmr_001']:.4f}")
+
+    # Output folder (dashboard only — no CSV or TXT)
+    out = Path("output")
+    out.mkdir(parents=True, exist_ok=True)
+
+    # ----------------------------------------------------------
+    # DASHBOARD  (2 × 3 grid)
+    # ----------------------------------------------------------
+    fig, axs = plt.subplots(2, 3, figsize=(16, 10))
+    fig.suptitle("Face Recognition — PCA vs LBP", fontsize=14, fontweight="bold")
+
+    # ── Gen/Imp – PCA ─────────────────────────────────────────
+    axs[0, 0].hist(Gen_pca, bins=50, alpha=0.6, label="Genuine",
+                   density=True, color="steelblue")
+    axs[0, 0].hist(Imp_pca, bins=50, alpha=0.6, label="Impostor",
+                   density=True, color="darkorange")
+    axs[0, 0].set_title("PCA — Gen/Imp Distribution")
+    axs[0, 0].set_xlabel("Cosine Similarity")
+    axs[0, 0].set_ylabel("Density")
+    axs[0, 0].legend()
+    axs[0, 0].grid(alpha=0.3)
+
+    # ── Gen/Imp – LBP ─────────────────────────────────────────
+    axs[0, 1].hist(Gen_lbp, bins=50, alpha=0.6, label="Genuine",
+                   density=True, color="steelblue")
+    axs[0, 1].hist(Imp_lbp, bins=50, alpha=0.6, label="Impostor",
+                   density=True, color="darkorange")
+    axs[0, 1].set_title("LBP — Gen/Imp Distribution")
+    axs[0, 1].set_xlabel("Cosine Similarity")
+    axs[0, 1].set_ylabel("Density")
+    axs[0, 1].legend()
+    axs[0, 1].grid(alpha=0.3)
+
+    # ── ROC Curve ─────────────────────────────────────────────
+    axs[0, 2].plot(res_pca['fpr'], res_pca['tpr'], linewidth=2,
+                   label=f"PCA  (EER={res_pca['eer']:.3f})")
+    axs[0, 2].plot(res_lbp['fpr'], res_lbp['tpr'], linewidth=2,
+                   label=f"LBP  (EER={res_lbp['eer']:.3f})")
+    axs[0, 2].plot([0, 1], [0, 1], "k--", linewidth=0.8)
+    axs[0, 2].set_title("ROC Curve")
+    axs[0, 2].set_xlabel("FMR (False Match Rate)")
+    axs[0, 2].set_ylabel("TMR (True Match Rate)")
+    axs[0, 2].legend()
+    axs[0, 2].grid(True, alpha=0.3)
+
+    # ── EER Bar Chart ─────────────────────────────────────────
+    methods = ["PCA", "LBP"]
+    eers    = [res_pca['eer'], res_lbp['eer']]
+    bars    = axs[1, 0].bar(methods, eers,
+                            color=["steelblue", "darkorange"], width=0.4)
+    axs[1, 0].set_title("EER Comparison (lower = better)")
+    axs[1, 0].set_ylabel("EER")
+    axs[1, 0].set_ylim(0, max(eers) * 1.3)
+    for bar, val in zip(bars, eers):
+        axs[1, 0].text(bar.get_x() + bar.get_width() / 2,
+                       bar.get_height() + 0.002,
+                       f"{val:.4f}", ha="center", va="bottom", fontweight="bold")
+
+    # ── d-prime Bar Chart ─────────────────────────────────────
+    dps  = [res_pca['d_prime'], res_lbp['d_prime']]
+    bars = axs[1, 1].bar(methods, dps,
+                         color=["steelblue", "darkorange"], width=0.4)
+    axs[1, 1].set_title("d-prime Comparison (higher = better)")
+    axs[1, 1].set_ylabel("d-prime")
+    axs[1, 1].set_ylim(0, max(dps) * 1.3)
+    for bar, val in zip(bars, dps):
+        axs[1, 1].text(bar.get_x() + bar.get_width() / 2,
+                       bar.get_height() + 0.02,
+                       f"{val:.4f}", ha="center", va="bottom", fontweight="bold")
+
+    # ── Styled Metrics Table (File 2 GUI style) ───────────────
+    axs[1, 2].axis("off")
 
     rows = [
-        ['Metric',            'PCA',                       'LBP'],
-        ['D-prime',           f"{res_pca['d_prime']:.3f}", f"{res_lbp['d_prime']:.3f}"],
-        ['EER',               f"{res_pca['eer']*100:.2f}%", f"{res_lbp['eer']*100:.2f}%"],
-        ['TMR @ FMR=1%',      f"{res_pca['tmr_1']*100:.2f}%", f"{res_lbp['tmr_1']*100:.2f}%"],
-        ['TMR @ FMR=0.01%',   f"{res_pca['tmr_001']*100:.2f}%", f"{res_lbp['tmr_001']*100:.2f}%"],
-        ['AUC',               f"{res_pca['auc']:.4f}",    f"{res_lbp['auc']:.4f}"],
-        ['── BONUS ──',       '──────',                    '──────'],
-        ['Rank-1 (TPIR)',     f"{res_pca['rank1']*100:.2f}%",        f"{res_lbp['rank1']*100:.2f}%"],
-        ['FPIR @ EER-thr',    f"{res_pca['fpir']*100:.2f}%",      f"{res_lbp['fpir']*100:.2f}%"],
-        ['FNIR @ EER-thr',    f"{res_pca['fnir']*100:.2f}%",      f"{res_lbp['fnir']*100:.2f}%"],
+        ["Metric",           "PCA",                             "LBP"],
+        ["D-prime",          f"{res_pca['d_prime']:.3f}",       f"{res_lbp['d_prime']:.3f}"],
+        ["EER",              f"{res_pca['eer']*100:.2f}%",      f"{res_lbp['eer']*100:.2f}%"],
+        ["TMR @ FMR=1%",     f"{res_pca['tmr_1']*100:.2f}%",   f"{res_lbp['tmr_1']*100:.2f}%"],
+        ["TMR @ FMR=0.01%",  f"{res_pca['tmr_001']*100:.2f}%", f"{res_lbp['tmr_001']*100:.2f}%"],
+        ["AUC",              f"{res_pca['auc']:.4f}",           f"{res_lbp['auc']:.4f}"],
+        ["── BONUS ──",      "──────",                          "──────"],
+        ["Rank-1 (TPIR)",    f"{res_pca['rank1']*100:.2f}%",   f"{res_lbp['rank1']*100:.2f}%"],
+        ["FPIR @ EER-thr",   f"{res_pca['fpir']*100:.2f}%",    f"{res_lbp['fpir']*100:.2f}%"],
+        ["FNIR @ EER-thr",   f"{res_pca['fnir']*100:.2f}%",    f"{res_lbp['fnir']*100:.2f}%"],
     ]
 
-    tbl = ax.table(cellText=rows[1:], colLabels=rows[0],
-                   loc='center', cellLoc='center')
+    tbl = axs[1, 2].table(cellText=rows[1:], colLabels=rows[0],
+                          loc="center", cellLoc="center")
     tbl.auto_set_font_size(False)
-    tbl.set_fontsize(10)
-    tbl.scale(1.15, 1.7)
+    tbl.set_fontsize(9)
+    tbl.scale(1.15, 1.6)
 
+    # Header row — dark navy
     for j in range(3):
-        tbl[0, j].set_facecolor('#2c3e50')
-        tbl[0, j].set_text_props(color='white', fontweight='bold')
+        tbl[0, j].set_facecolor("#2c3e50")
+        tbl[0, j].set_text_props(color="white", fontweight="bold")
+    # Bonus separator row (index 7 in rendered table = rows[7])
     for j in range(3):
-        tbl[6, j].set_facecolor('#ecf0f1')
-        tbl[6, j].set_text_props(fontweight='bold', color='#7f8c8d')
+        tbl[7, j].set_facecolor("#ecf0f1")
+        tbl[7, j].set_text_props(fontweight="bold", color="#7f8c8d")
 
-    ax.set_title('Metrics Summary', fontsize=11, pad=15)
+    axs[1, 2].set_title("All Metrics Summary")
 
     plt.tight_layout()
-    
-    os.makedirs('static/images', exist_ok=True)
-    plot_path = 'static/images/results.png'
-    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+
+    # Save to output/ AND static/images/ (for GUI / Flask route)
+    os.makedirs("static/images", exist_ok=True)
+    for dest in [out / "final_dashboard.png", Path("static/images/results.png")]:
+        plt.savefig(dest, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
+    print(f"\nDashboard saved → {out / 'final_dashboard.png'}")
+    print("DONE ✔")
+
+    # ----------------------------------------------------------
+    # RETURN structured dict consumed by GUI / Flask route
+    # ----------------------------------------------------------
     return {
         "pca": {
             "d_prime": res_pca['d_prime'],
-            "eer": res_pca['eer'],
-            "tmr_1": res_pca['tmr_1'],
+            "eer":     res_pca['eer'],
+            "tmr_1":   res_pca['tmr_1'],
             "tmr_001": res_pca['tmr_001'],
-            "auc": res_pca['auc'],
-            "rank1": res_pca['rank1'],
-            "fpir": res_pca['fpir'],
-            "fnir": res_pca['fnir']
+            "auc":     res_pca['auc'],
+            "rank1":   res_pca['rank1'],
+            "fpir":    res_pca['fpir'],
+            "fnir":    res_pca['fnir'],
         },
         "lbp": {
             "d_prime": res_lbp['d_prime'],
-            "eer": res_lbp['eer'],
-            "tmr_1": res_lbp['tmr_1'],
+            "eer":     res_lbp['eer'],
+            "tmr_1":   res_lbp['tmr_1'],
             "tmr_001": res_lbp['tmr_001'],
-            "auc": res_lbp['auc'],
-            "rank1": res_lbp['rank1'],
-            "fpir": res_lbp['fpir'],
-            "fnir": res_lbp['fnir']
+            "auc":     res_lbp['auc'],
+            "rank1":   res_lbp['rank1'],
+            "fpir":    res_lbp['fpir'],
+            "fnir":    res_lbp['fnir'],
         },
-        "plot_url": f"/static/images/results.png"
+        "plot_url": "/static/images/results.png",
     }
 
+
+# =========================================================
+# ENTRY POINT
+# =========================================================
 if __name__ == "__main__":
-    results = run_pipeline()
-    print("Metrics extracted successfully. Plot saved to static/images/results.png.")
+    run_pipeline(dataset_path="dataset")
