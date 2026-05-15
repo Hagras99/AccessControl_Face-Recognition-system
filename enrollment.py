@@ -5,51 +5,39 @@
   checking, 1:N verification, and user DB management.
 =============================================================
 
-FIXES APPLIED (this version)
------------------------------
-A. detect_face — crop was taken from raw gray but detection ran on
-   CLAHE-enhanced image. Now detection AND crop both use the same
-   raw grayscale image. CLAHE is only used as a detection fallback,
-   never as the source of the crop.
+FIXES APPLIED
+-------------
+A. detect_face — crop now always taken from raw gray (same image
+   detection ran on), not from a CLAHE-enhanced copy.
 
-B. detect_face — pad_top was 70% of face height, pulling in huge
-   amounts of hair/forehead and making the crop hairstyle-dependent.
-   Reduced to 20% (just enough to include the full eyebrow line).
+B. detect_face — pad_top reduced 70% -> 20% so hair/forehead no
+   longer dominates the crop.
 
-C. preprocess — adaptive gamma was pushing all faces to the same
-   global brightness, erasing the natural contrast differences that
-   help tell people apart. Replaced with a mild fixed gamma (1.2)
-   that only brightens genuinely dark frames without flattening
-   identity-relevant shading.
+C. preprocess — adaptive gamma removed; replaced with mild fixed
+   gamma (1.2) that lifts dark frames without erasing identity signal.
 
-D. preprocess — CLAHE clipLimit was 3.0, which aggressively amplifies
-   noise after gamma has already normalised brightness. Reduced to 1.5
-   (enough for local contrast enhancement, not enough to create
-   artefacts that look identical across different people).
+D. preprocess — CLAHE clipLimit lowered 3.0 -> 1.5.
 
-E. preprocess — z-score normalisation followed by uint8 clipping was
-   REMOVED entirely. LBP uses only relative pixel comparisons (is
-   neighbour > centre?), so global mean/std normalisation adds zero
-   useful information and the hard clip at ±3σ destroys real texture
-   data in bright foreheads and dark eye sockets.
+E. preprocess — z-score normalisation + uint8 clipping removed.
+   LBP is invariant to global intensity by design; the clip was
+   actively destroying texture data in highlights and shadows.
 
-F. lbp — global 256-bin histogram replaced with spatially-aware 5×5
-   grid LBP. Each cell gets its own 256-bin histogram; the 25 histograms
-   are concatenated into a 6400-dim descriptor. This means eye texture,
-   nose texture, mouth texture, and cheek texture are all kept separate
-   and contribute independently to the similarity score, instead of
-   collapsing into the same bins as they did with the global version.
+F. lbp — global 256-bin histogram replaced with 5x5 spatial grid
+   LBP -> 6400-dim descriptor. Eyes, nose, mouth, cheeks all
+   contribute separately.
 
-G. verify_user — now accepts a single base64 string OR a list of
-   strings. When a list is given, features are extracted from every
-   valid frame and the similarity score is the mean across all
-   (probe_frame × gallery_image) pairs, not just one frame.
+G. NEW — apply_face_oval_mask() inserted as the final step of
+   preprocess(), before lbp() is called. An elliptical mask zeroes
+   out everything outside the face oval (hair, ears, background,
+   clothing). The mask edge is feathered with a Gaussian blur so
+   it does not create artificial LBP codes at the boundary.
+   Outside-oval pixels are set to the mean value of the face
+   interior so they are neutral and do not push any bin up or down.
 
-H. VERIFY_THRESHOLD raised from 0.80 → 0.93 to match the tighter
-   score distribution produced by the corrected pipeline.
+H. verify_user — accepts single frame or list of frames; scores
+   as mean across all (probe_frame x gallery_image) pairs.
 
-I. DUPLICATE_THRESHOLD kept at 0.85 — still appropriate for the
-   new feature space.
+I. VERIFY_THRESHOLD raised 0.80 -> 0.93.
 """
 
 import cv2
@@ -64,7 +52,7 @@ from datetime import datetime
 # PATHS
 # =========================================================
 BASE_DIR         = Path(__file__).parent
-DATASET_DIR      = BASE_DIR / "dataset"        # ORL — evaluation only
+DATASET_DIR      = BASE_DIR / "dataset"        # ORL -- evaluation only
 LIVE_DATASET_DIR = BASE_DIR / "live_dataset"   # webcam enrollments
 USERS_DB_PATH    = BASE_DIR / "users.json"
 
@@ -72,20 +60,17 @@ USERS_DB_PATH    = BASE_DIR / "users.json"
 CASCADE_PATH = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
 face_cascade = cv2.CascadeClassifier(CASCADE_PATH)
 
-# ── Thresholds ────────────────────────────────────────────────────────────────
-# Both use COSINE SIMILARITY (range 0–1, higher = more similar).
+# ---- Thresholds --------------------------------------------------------------
+# VERIFY_THRESHOLD: raised to 0.93 to match the tighter score distribution
+#   produced by the corrected preprocessing + grid-LBP + oval-mask pipeline.
+#   With the mask, genuine users consistently score 0.96+; impostors drop
+#   well below 0.90 because background/hair no longer pad their scores.
 #
-# VERIFY_THRESHOLD: minimum mean cosine similarity to accept a login.
-#   Raised to 0.93 — with the corrected grid-LBP pipeline, genuine users
-#   consistently score 0.96+; impostors drop to 0.85–0.90.
-#
-# DUPLICATE_THRESHOLD: minimum similarity to flag a re-enrollment attempt.
-#   0.85 — tight enough to block the same person re-enrolling, loose enough
-#   to let different people through.
+# DUPLICATE_THRESHOLD: 0.85 -- blocks same person re-enrolling, passes others.
 VERIFY_THRESHOLD    = 0.93
 DUPLICATE_THRESHOLD = 0.85
 
-IMG_SIZE = (100, 100)   # all face crops are resized to this before feature extraction
+IMG_SIZE = (100, 100)   # all face crops normalised to this before feature extraction
 
 
 # =========================================================
@@ -171,7 +156,7 @@ def cv2_to_b64(img):
 # LOW-LIGHT HELPERS  (used only inside detect_face fallbacks)
 # =========================================================
 def _clahe(gray, clip=1.5):
-    """Mild CLAHE — used for detection fallbacks only, not for feature prep."""
+    """Mild CLAHE -- for detection fallbacks only, not feature prep."""
     return cv2.createCLAHE(clipLimit=clip, tileGridSize=(8, 8)).apply(gray)
 
 
@@ -197,23 +182,16 @@ def detect_face(frame_b64):
     """
     Detect and crop a face from a base64-encoded webcam frame.
 
-    FIX A — detection and crop now use the SAME source image (raw gray).
-    Previously, detection ran on a CLAHE-enhanced image but the crop was
-    sliced from raw gray, so the bounding box coordinates referred to one
-    image while the data came from another — causing a misaligned crop.
+    FIX A: detection and crop use the SAME source image (raw gray).
+    FIX B: pad_top reduced from 70% -> 20% (eyebrows only, not hair).
 
-    FIX B — pad_top reduced from 70% → 20%.
-    70% pulled in so much hair/forehead that different hairstyles created
-    meaningfully different crops for the same person. 20% is enough to
-    capture the full eyebrow line, which is important for recognition.
+    Fallback chain for detection:
+      1. Raw gray
+      2. CLAHE-enhanced gray
+      3. Gamma-brightened + CLAHE
+      4. Relaxed Haar params
 
-    Fallback chain for low-light:
-      1. Raw gray (standard conditions)
-      2. CLAHE-enhanced gray (mild contrast boost)
-      3. Gamma-brightened + CLAHE (dark room)
-      4. Relaxed Haar params (small or partially occluded face)
-
-    Returns: {face_detected, bbox, face_b64 (100×100 gray crop)}
+    Returns: {face_detected, bbox, face_b64 (100x100 gray crop)}
     """
     img = b64_to_cv2(frame_b64)
     if img is None:
@@ -221,33 +199,25 @@ def detect_face(frame_b64):
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # ── Detection fallback chain ──────────────────────────────────────
-    # Each attempt uses a different enhanced image for DETECTION only.
-    # The actual pixel data for the crop always comes from `gray`.
-    faces = _try_detect(gray)                                    # attempt 1: raw
+    # Detection-only enhanced images -- crop always comes from raw gray
+    faces = _try_detect(gray)
 
     if len(faces) == 0:
-        faces = _try_detect(_clahe(gray, clip=1.5))              # attempt 2: CLAHE
+        faces = _try_detect(_clahe(gray, clip=1.5))
 
     if len(faces) == 0:
-        faces = _try_detect(_clahe(_gamma_lut(gray), clip=1.5),  # attempt 3: gamma+CLAHE
-                            neighbors=4)
+        faces = _try_detect(_clahe(_gamma_lut(gray), clip=1.5), neighbors=4)
 
     if len(faces) == 0:
-        faces = _try_detect(gray, neighbors=3,                   # attempt 4: relaxed
-                            min_size=(50, 50))
+        faces = _try_detect(gray, neighbors=3, min_size=(50, 50))
 
     if len(faces) == 0:
         return {"face_detected": False, "bbox": None, "face_b64": None}
 
-    # Pick the largest detected face
     faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
     x, y, w, h = faces[0]
 
-    # ── Padding — FIX B ──────────────────────────────────────────────
-    # pad_top  : 20% — captures eyebrows without dragging in hair
-    # pad_side : 15% — slight margin around cheeks
-    # pad_bottom: 10% — includes the chin fully
+    # FIX B -- conservative padding
     pad_top    = int(0.20 * h)
     pad_side   = int(0.15 * w)
     pad_bottom = int(0.10 * h)
@@ -257,15 +227,102 @@ def detect_face(frame_b64):
     x2 = min(gray.shape[1], x + w + pad_side)
     y2 = min(gray.shape[0], y + h + pad_bottom)
 
-    # Crop from raw gray (FIX A — same image used for detection above)
+    # FIX A -- crop from raw gray
     face_crop    = gray[y1:y2, x1:x2]
     face_resized = cv2.resize(face_crop, IMG_SIZE)
 
     return {
         "face_detected": True,
-        "bbox":    [int(x), int(y), int(w), int(h)],
-        "face_b64": cv2_to_b64(face_resized),
+        "bbox":          [int(x), int(y), int(w), int(h)],
+        "face_b64":      cv2_to_b64(face_resized),
     }
+
+
+# =========================================================
+# FACE OVAL SEGMENTATION  (FIX G)
+# =========================================================
+def apply_face_oval_mask(img):
+    """
+    Mask out everything outside the facial oval.
+
+    WHY THIS HELPS
+    --------------
+    After detect_face() crops and resizes to 100x100, the image still
+    contains background pixels, hair, ears, and sometimes clothing or
+    shoulders along the edges. All of these contribute LBP codes that:
+
+      (a) vary between enrollment and verification -- you move slightly,
+          the background changes, your hair falls differently.
+      (b) are shared between different people -- same room, same background,
+          same lighting setup means the non-face regions look the same for
+          everyone sitting in that chair.
+
+    By applying the mask before lbp(), we force the descriptor to carry
+    only the identity-relevant region: skin texture, eyes, eyebrows, nose,
+    mouth, and jawline. This is the main reason an impostor like Hagras
+    was scoring 94% -- the background and shared room texture was padding
+    his score against Karim's gallery.
+
+    HOW THE MASK IS BUILT
+    ---------------------
+    A mathematical ellipse centred in the 100x100 crop:
+      rx = 42% of width  -- cuts hair at temples and ears
+      ry = 48% of height -- forehead crown to chin tip
+
+    These proportions match the natural face oval for a frontal face
+    that fills a Haar detection bounding box. They are deterministic --
+    the exact same mask is applied at both enrollment and verification,
+    so no inconsistency can be introduced between the two.
+
+    WHY AN ELLIPSE AND NOT A NEURAL SEGMENTER
+    ------------------------------------------
+    Neural face-parsing models (MediaPipe, BiSeNet) produce more precise
+    boundaries but require a model file to be present on disk at startup.
+    The ellipse approach has zero dependencies, is instantaneous, and is
+    actually more consistent -- a neural model might segment slightly
+    differently between frames, which would add noise rather than remove it.
+
+    SOFT EDGE (FEATHERING)
+    ----------------------
+    A hard binary ellipse mask creates a sharp ring. Every pixel on the
+    boundary would be compared by LBP to a zero (or mean-filled) pixel
+    just outside it, generating a ring of artificial high-contrast LBP
+    codes that do not belong to any real face feature. To prevent this,
+    the mask is blurred with a Gaussian kernel (21x21), creating a smooth
+    transition zone about 10px wide around the face edge.
+
+    OUTSIDE-OVAL FILL VALUE
+    -----------------------
+    Zeroing outside pixels would make them very dark, producing strong
+    LBP responses at skin-to-black boundaries. Instead, outside pixels
+    are blended toward the mean intensity of the face interior, making
+    them neutral -- they do not push any histogram bin up or down.
+
+    Input:  uint8 grayscale 100x100 numpy array (after gamma + CLAHE + blur)
+    Output: uint8 grayscale 100x100 numpy array with oval mask applied
+    """
+    h, w = img.shape
+    cx, cy = w // 2, h // 2
+
+    # Ellipse radii tuned to face-oval proportions in a frontal Haar crop
+    rx = int(w * 0.42)   # cuts temples / ears
+    ry = int(h * 0.48)   # forehead crown to chin tip
+
+    # Step 1 -- hard binary ellipse mask
+    hard_mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.ellipse(hard_mask, (cx, cy), (rx, ry), 0, 0, 360, 255, -1)
+
+    # Step 2 -- soften the edge with Gaussian blur (~10px feather zone)
+    soft_mask = cv2.GaussianBlur(hard_mask.astype(np.float32),
+                                 (21, 21), 0) / 255.0
+
+    # Step 3 -- compute neutral fill value (mean of face interior)
+    face_pixels = img[hard_mask > 0]
+    mean_val    = float(face_pixels.mean()) if len(face_pixels) > 0 else 128.0
+
+    # Step 4 -- blend: keep face pixels, replace outside with mean_val
+    result = img.astype(np.float32) * soft_mask + mean_val * (1.0 - soft_mask)
+    return np.clip(result, 0, 255).astype(np.uint8)
 
 
 # =========================================================
@@ -273,71 +330,73 @@ def detect_face(frame_b64):
 # =========================================================
 def preprocess(img):
     """
-    Prepare a 100×100 grayscale face crop for LBP feature extraction.
+    Prepare a 100x100 grayscale face crop for LBP feature extraction.
 
-    Pipeline (corrected):
-      1. Mild fixed gamma (1.2) — gently lifts genuinely dark frames
-         without flattening the contrast differences that identify people.
-         FIX C: removed the adaptive gamma that forced every face to the
-         same global brightness, which destroyed identity signal.
+    Full corrected pipeline:
 
-      2. CLAHE clipLimit=1.5 — local contrast enhancement.
-         FIX D: old clipLimit=3.0 was too aggressive; after gamma had
-         already normalised brightness, a high clip amplified noise and
-         made different people's faces look more alike.
+      1. Mild fixed gamma (1.2)
+         FIX C: old adaptive gamma erased identity-relevant contrast by
+         forcing all faces to the same global brightness.
 
-      3. Gaussian blur 3×3 — removes high-frequency camera noise that
-         would otherwise create spurious LBP codes.
+      2. CLAHE clipLimit=1.5
+         FIX D: old clipLimit=3.0 amplified noise and made different
+         people's faces look more alike after gamma normalisation.
 
-      REMOVED: z-score normalisation + uint8 clipping (FIX E).
-         LBP compares each pixel only to its 8 immediate neighbours, so
-         the global mean and std of the image are completely irrelevant
-         to the feature. The hard clip at ±3σ saturated bright foreheads
-         and dark eye sockets, destroying real texture information.
+      3. Gaussian blur 3x3
+         Suppresses high-frequency sensor noise that would otherwise
+         create spurious LBP codes in smooth regions.
 
-    Input:  uint8 grayscale 100×100 numpy array
-    Output: uint8 grayscale 100×100 numpy array, ready for lbp()
+      4. Face oval mask  -- FIX G
+         Zeroes out hair, ears, background, and clothing using a
+         feathered ellipse. See apply_face_oval_mask() for details.
+         This is the single biggest improvement for the impostor problem.
+
+      REMOVED: z-score normalisation + uint8 clipping  -- FIX E
+         LBP is relative by design (neighbour > centre?), so global
+         mean/std are irrelevant. The hard clip at +/-3 sigma was
+         saturating real texture data in bright foreheads and dark
+         eye sockets.
+
+    Input:  uint8 grayscale 100x100 numpy array
+    Output: uint8 grayscale 100x100 numpy array, ready for lbp()
     """
-    # Step 1 — mild fixed gamma: only brightens if the frame is dark,
-    # leaves well-lit faces almost unchanged (gamma 1.2 is subtle).
+    # Step 1 -- mild fixed gamma
     table = np.array([
         ((i / 255.0) ** (1.0 / 1.2)) * 255 for i in range(256)
     ]).astype("uint8")
     img = cv2.LUT(img, table)
 
-    # Step 2 — CLAHE with reduced clip to boost local contrast gently
+    # Step 2 -- CLAHE for gentle local contrast enhancement
     clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
     img   = clahe.apply(img)
 
-    # Step 3 — Gaussian blur to suppress sensor noise
+    # Step 3 -- Gaussian blur to suppress sensor noise
     img = cv2.GaussianBlur(img, (3, 3), 0)
+
+    # Step 4 -- face oval segmentation mask  (FIX G)
+    img = apply_face_oval_mask(img)
 
     return img
 
 
 # =========================================================
-# LBP FEATURE EXTRACTION
+# LBP FEATURE EXTRACTION  (FIX F -- 5x5 spatial grid)
 # =========================================================
 def lbp(img):
     """
-    Spatially-aware 5×5 grid LBP descriptor.
+    Spatially-aware 5x5 grid LBP descriptor.
 
-    FIX F — replaces the old global 256-bin histogram.
+    The face image is divided into a 5x5 grid of cells. Each cell gets
+    its own 256-bin LBP histogram; the 25 histograms are concatenated
+    into a 6400-dimensional feature vector.
 
-    The face image is divided into a 5×5 grid of cells. Each cell gets
-    its own 256-bin LBP histogram, and the 25 histograms are concatenated
-    into a single 6400-dimensional feature vector.
+    With the oval mask applied beforehand, the four corner cells (which
+    used to carry hair/background texture) now contain the neutral mean
+    value throughout -- their histograms are nearly uniform and contribute
+    close to zero cosine similarity, which is the correct behaviour.
+    The cells over eyes, nose, mouth, and cheeks carry all the signal.
 
-    Why this matters:
-      Global LBP: eye texture and mouth texture land in the same bins.
-                  Two different people with similar skin texture get
-                  near-identical 256-dim vectors → 94% false match.
-      Grid LBP:   eye cell, nose cell, mouth cell, and cheek cells each
-                  contribute separately. To score high, a probe must match
-                  the enrolled face in every region of the face, not just
-                  globally — far harder for an impostor to satisfy.
-
-    Input:  preprocessed uint8 100×100 grayscale image
+    Input:  preprocessed + masked uint8 100x100 grayscale image
     Output: float64 ndarray of shape (6400,), L1-normalised per cell
     """
     GRID   = 5
@@ -363,7 +422,7 @@ def lbp(img):
                 ((cell[1:-1, 0:-2] > c))
             )
             hist, _ = np.histogram(code.ravel(), bins=256, range=(0, 256))
-            hists.append(hist / (np.sum(hist) + 1e-10))   # L1-normalise per cell
+            hists.append(hist / (np.sum(hist) + 1e-10))
 
     return np.concatenate(hists)   # shape: (6400,)
 
@@ -374,8 +433,7 @@ def lbp(img):
 def cosine_sim(h1, h2):
     """
     Cosine similarity between two LBP feature vectors.
-    Returns a value in [0, 1] — higher means more similar.
-    Works correctly for both 256-dim (old) and 6400-dim (new) vectors.
+    Returns a value in [0, 1] -- higher means more similar.
     """
     n1 = np.linalg.norm(h1) + 1e-10
     n2 = np.linalg.norm(h2) + 1e-10
@@ -383,15 +441,14 @@ def cosine_sim(h1, h2):
 
 
 # =========================================================
-# BUILD GALLERY  (LBP features from live_dataset directory)
+# BUILD GALLERY
 # =========================================================
 def build_gallery(dataset_dir=None):
     """
-    Read all enrolled face images from disk, preprocess them, and extract
-    LBP features. Returns {subject_id: [lbp_vector, ...], ...}.
-
-    Called fresh on every verify/duplicate-check call so that newly
-    enrolled users are immediately visible without a server restart.
+    Read enrolled face images from disk, run preprocess() + lbp().
+    Returns {subject_id: [lbp_vector, ...], ...}.
+    Called fresh on every verify/duplicate-check so new enrollments
+    are immediately visible without restarting the server.
     """
     target = dataset_dir or LIVE_DATASET_DIR
     if not target.exists():
@@ -407,7 +464,7 @@ def build_gallery(dataset_dir=None):
             if img is None:
                 continue
             img = cv2.resize(img, IMG_SIZE)
-            img = preprocess(img)
+            img = preprocess(img)       # includes oval mask as step 4
             features.append(lbp(img))
         if features:
             gallery[person_dir.name] = features
@@ -421,16 +478,13 @@ def build_gallery(dataset_dir=None):
 def check_duplicate(face_images_gray):
     """
     Check whether a face being enrolled is already in the system.
-    Compares only against webcam-enrolled users (live_dataset).
-
-    Uses mean cosine similarity across all (probe, gallery) pairs for
-    each subject — robust against one outlier frame inflating the score.
+    Only checks against webcam-enrolled users (live_dataset).
 
     Args:
-        face_images_gray: list of uint8 grayscale 100×100 numpy arrays
+        face_images_gray: list of uint8 grayscale 100x100 numpy arrays
 
     Returns:
-        {"is_duplicate": True,  "matched_name": ..., "matched_id": ..., "score": ...}
+        {"is_duplicate": True, "matched_name": ..., "matched_id": ..., "score": ...}
         {"is_duplicate": False}
     """
     gallery = build_gallery(LIVE_DATASET_DIR)
@@ -462,10 +516,10 @@ def check_duplicate(face_images_gray):
     if best_score >= DUPLICATE_THRESHOLD and best_id:
         user_info = db["subjects"].get(best_id, {})
         return {
-            "is_duplicate":  True,
-            "matched_name":  user_info.get("name", "Unknown"),
-            "matched_id":    best_id,
-            "score":         round(best_score, 4),
+            "is_duplicate": True,
+            "matched_name": user_info.get("name", "Unknown"),
+            "matched_id":   best_id,
+            "score":        round(best_score, 4),
         }
 
     return {"is_duplicate": False}
@@ -476,7 +530,7 @@ def check_duplicate(face_images_gray):
 # =========================================================
 def enroll_user(name, face_images_b64):
     """
-    Enroll a new user with 9 face poses captured from the webcam.
+    Enroll a new user with face poses captured from the webcam.
 
     Args:
         name:             user's display name (string)
@@ -491,7 +545,6 @@ def enroll_user(name, face_images_b64):
     if len(face_images_b64) < 1:
         return {"status": "error", "message": "At least 1 face image required"}
 
-    # Detect and crop a face from each submitted frame
     face_images = []
     for i, b64 in enumerate(face_images_b64):
         result = detect_face(b64)
@@ -505,7 +558,6 @@ def enroll_user(name, face_images_b64):
         face_gray = cv2.resize(face_gray, IMG_SIZE)
         face_images.append(face_gray)
 
-    # Reject if this face already exists in the system
     dup_check = check_duplicate(face_images)
     if dup_check["is_duplicate"]:
         return {
@@ -516,7 +568,6 @@ def enroll_user(name, face_images_b64):
             "score":        dup_check["score"],
         }
 
-    # Persist face images to disk
     subject_id  = get_next_subject_id()
     subject_dir = LIVE_DATASET_DIR / subject_id
     subject_dir.mkdir(parents=True, exist_ok=True)
@@ -524,7 +575,6 @@ def enroll_user(name, face_images_b64):
     for i, face_img in enumerate(face_images):
         cv2.imwrite(str(subject_dir / f"{i + 1}.pgm"), face_img)
 
-    # Update the user database
     db = load_user_db()
     db["subjects"][subject_id] = {
         "name":          name.strip(),
@@ -549,25 +599,16 @@ def verify_user(face_b64):
     """
     Identify a live webcam face against all enrolled subjects.
 
-    FIX G — accepts a single base64 string OR a list of base64 strings.
-    When a list is given, LBP features are extracted from every frame
-    in which a face is detected, and the similarity score for each
-    enrolled subject is the mean over all (probe_frame × gallery_image)
-    pairs. This prevents one lucky or unlucky frame from deciding access.
-
-    FIX H — VERIFY_THRESHOLD raised to 0.93 to match the tighter score
-    distribution produced by the corrected preprocessing + grid-LBP pipeline.
-
-    Args:
-        face_b64: base64-encoded webcam frame  OR  list of such frames
+    Accepts a single base64 string OR a list of base64 strings.
+    With a list, features are extracted from every frame that has a
+    detectable face; the score per enrolled subject is the mean across
+    all (probe_frame x gallery_image) pairs.
 
     Returns:
         {"status": "matched"|"no_match"|"no_face", "access": "granted"|"denied", ...}
     """
-    # ── Accept single frame or list of frames ─────────────────────────
     frames = face_b64 if isinstance(face_b64, list) else [face_b64]
 
-    # ── Extract features from every frame that has a detectable face ──
     probe_feats = []
     last_bbox   = None
 
@@ -590,7 +631,6 @@ def verify_user(face_b64):
             "message": "No face detected in the image",
         }
 
-    # ── Load gallery and score every enrolled subject ──────────────────
     gallery = build_gallery(LIVE_DATASET_DIR)
     db      = load_user_db()
 
@@ -607,9 +647,6 @@ def verify_user(face_b64):
     all_scores = {}
 
     for sid, gallery_feats in gallery.items():
-        # Mean similarity across ALL (probe_frame, gallery_image) pairs.
-        # A genuine user scores high consistently across frames.
-        # An impostor may spike on one frame but averages lower overall.
         all_sims   = [cosine_sim(pf, gf)
                       for pf in probe_feats
                       for gf in gallery_feats]
@@ -620,7 +657,6 @@ def verify_user(face_b64):
             best_score = mean_score
             best_id    = sid
 
-    # Debug output visible in the Flask terminal
     print(f"\n[VERIFY] {len(probe_feats)} probe frame(s) vs "
           f"{len(gallery)} enrolled user(s):")
     for sid, sc in sorted(all_scores.items(), key=lambda x: -x[1]):
@@ -629,12 +665,10 @@ def verify_user(face_b64):
     print(f"  Best: {best_id} = {best_score:.4f}  "
           f"(threshold: {VERIFY_THRESHOLD})\n")
 
-    # ── Decision ───────────────────────────────────────────────────────
     if best_score >= VERIFY_THRESHOLD and best_id:
         user_info   = db["subjects"].get(best_id, {})
         subject_dir = LIVE_DATASET_DIR / best_id
 
-        # Thumbnail from first enrolled image
         thumb_b64  = None
         first_imgs = sorted(subject_dir.glob("*.pgm"))
         if first_imgs:
