@@ -245,6 +245,12 @@
       "enrolled_date": "2026-05-16T01:58:06.899498",
       "source": "webcam",
       "image_count": 9
+    },
+    "u2": {
+      "name": "Karim",
+      "enrolled_date": "2026-05-16T02:17:29.543432",
+      "source": "webcam",
+      "image_count": 9
     }
   }
 }

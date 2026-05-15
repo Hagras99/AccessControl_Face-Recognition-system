@@ -1,6 +1,6 @@
 {
-  "verify_threshold": 0.85,
+  "verify_threshold": 0.89,
   "duplicate_threshold": 0.88,
-  "lbp_eer_threshold": 0.85,
+  "lbp_eer_threshold": 0.89,
   "generated_from": "Manually set to 0.85"
 }
