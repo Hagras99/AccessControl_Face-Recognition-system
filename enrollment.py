@@ -60,7 +60,7 @@ face_cascade = cv2.CascadeClassifier(CASCADE_PATH)
 # DUPLICATE_THRESHOLD: minimum similarity to flag a re-enrollment attempt.
 #   - Old value: 0.92 chi-squared (too aggressive — blocked different people)
 #   - New value: 0.85 cosine (blocks the same person, passes different people)
-VERIFY_THRESHOLD    = 0.85
+VERIFY_THRESHOLD    = 0.80
 DUPLICATE_THRESHOLD = 0.85
 
 IMG_SIZE = (100, 100)
@@ -242,9 +242,44 @@ def lbp(img):
 
 
 def preprocess(img):
-    """CLAHE-based preprocessing."""
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    return clahe.apply(img)
+    """
+    Illumination-robust preprocessing pipeline:
+    1. Gamma correction — lifts dark images to a standard brightness level
+    2. CLAHE — adaptive contrast enhancement (handles both dark and bright)
+    3. Gaussian blur — removes noise amplified by the above steps
+    4. Normalize to zero mean / unit std — makes features lighting-invariant
+
+    This ensures a face captured in dark and the same face captured in
+    bright light produce nearly identical LBP feature vectors.
+    """
+    # Step 1: Adaptive gamma correction to normalize brightness toward ~120/255
+    mean_brightness = float(np.mean(img))
+    if mean_brightness < 1:
+        mean_brightness = 1.0
+    gamma = np.log(120.0 / 255.0) / np.log(mean_brightness / 255.0 + 1e-6)
+    gamma = float(np.clip(gamma, 0.4, 2.5))
+    table = np.array([
+        ((i / 255.0) ** (1.0 / gamma)) * 255 for i in range(256)
+    ]).astype("uint8")
+    img = cv2.LUT(img, table)
+
+    # Step 2: CLAHE for local contrast normalization
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    img = clahe.apply(img)
+
+    # Step 3: Light Gaussian blur to reduce noise
+    img = cv2.GaussianBlur(img, (3, 3), 0)
+
+    # Step 4: Per-image normalization to zero mean / unit std
+    img_f = img.astype(np.float32)
+    mean, std = img_f.mean(), img_f.std()
+    if std < 1e-6:
+        std = 1e-6
+    img_f = (img_f - mean) / std
+    # Scale back to uint8 range for LBP
+    img = np.clip((img_f + 3.0) * (255.0 / 6.0), 0, 255).astype(np.uint8)
+
+    return img
 
 
 def cosine_sim(h1, h2):
