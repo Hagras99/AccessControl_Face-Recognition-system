@@ -9,11 +9,6 @@
     POST /api/verify    → Verify face (1:N identification)
     POST /api/detect    → Real-time face detection
     GET  /api/users     → List all enrolled users
-
-  FIX (verify route) — now accepts multi-frame input.
-  Send {"images": ["<b64>", "<b64>", ...]} for a more robust
-  decision (mean score across frames), or the legacy
-  {"image": "<b64>"} for a single-frame check.
 =============================================================
 """
 
@@ -104,12 +99,6 @@ def api_verify():
 
     Multi-frame (recommended — more robust decision):
         { "images": ["<base64>", "<base64>", "<base64>"] }
-
-    With multi-frame input, verify_user() extracts features from every
-    frame in which a face is detected, then scores each enrolled subject
-    as the mean similarity across all (probe_frame × gallery_image) pairs.
-    This prevents one blurry or accidentally similar frame from granting
-    or denying access on its own.
     """
     try:
         data = request.get_json()
