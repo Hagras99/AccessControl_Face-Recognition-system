@@ -17,7 +17,6 @@ LBP  – texture / local-feature method.
        Vectorised NumPy implementation (~100× faster than pixel loops).
 """
 
-import os
 import cv2
 import numpy as np
 import matplotlib
@@ -361,7 +360,7 @@ def run_pipeline(dataset_path="dataset"):
     plt.tight_layout()
 
     # Save to output/ AND static/images/ (for GUI / Flask route)
-    os.makedirs("static/images", exist_ok=True)
+    Path("static/images").mkdir(parents=True, exist_ok=True)
     for dest in [out / "final_dashboard.png", Path("static/images/results.png")]:
         plt.savefig(dest, dpi=150, bbox_inches="tight")
     plt.close(fig)
