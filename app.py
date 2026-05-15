@@ -3,12 +3,13 @@
   Flask Server — Biometric Face Recognition Access Control
 
   Routes:
-    GET  /              → Render SPA
-    POST /api/run       → Run PCA/LBP evaluation pipeline
-    POST /api/enroll    → Enroll new user (9 poses)
-    POST /api/verify    → Verify face (1:N identification)
-    POST /api/detect    → Real-time face detection
-    GET  /api/users     → List all enrolled users
+    GET    /                  -> Render SPA
+    POST   /api/run           -> Run PCA/LBP evaluation pipeline
+    POST   /api/enroll        -> Enroll new user (9 poses)
+    POST   /api/verify        -> Verify face (1:N identification)
+    POST   /api/detect        -> Real-time face detection
+    GET    /api/users         -> List verifiable (webcam) users
+    DELETE /api/users/<id>    -> Remove an enrolled user
 =============================================================
 """
 
@@ -17,7 +18,7 @@ from flask import Flask, render_template, jsonify, request
 from main import run_pipeline
 from enrollment import (
     init_user_db, detect_face, enroll_user,
-    verify_user, get_all_users,
+    verify_user, get_all_users, delete_user,
 )
 
 app = Flask(__name__)
@@ -105,12 +106,47 @@ def api_verify():
         if not data:
             return jsonify({"status": "error", "message": "No data provided"}), 400
 
-        # Multi-frame path
+        # Multi-frame path — run verification on every frame, then use
+        # majority-vote on the predicted identity and median score for that
+        # identity.  Taking the raw maximum score is exploitable by a single
+        # lucky outlier frame; median + majority-vote is far more robust.
         if "images" in data and isinstance(data["images"], list):
-            payload = data["images"]
-            if not payload:
+            frames = data["images"]
+            if not frames:
                 return jsonify({"status": "error",
                                 "message": "images list is empty"}), 400
+
+            from collections import Counter
+            import statistics as _stats
+
+            candidates = []          # list of (predicted_id | None, score, result)
+            last_result = None
+            for frame_b64 in frames:
+                r = verify_user(frame_b64)
+                last_result = r
+                if r.get("status") == "matched" and "user" in r:
+                    candidates.append((r["user"]["id"], r.get("score", 0.0), r))
+                else:
+                    candidates.append((None, r.get("best_score", 0.0), r))
+
+            # Majority vote on predicted identity
+            matched_ids = [sid for sid, _, _ in candidates if sid is not None]
+            if matched_ids:
+                top_id = Counter(matched_ids).most_common(1)[0][0]
+                top_scores = [s for sid, s, _ in candidates if sid == top_id]
+                median_score = _stats.median(top_scores)
+                # Pick the individual result whose score is closest to median
+                result = min(
+                    [(sid, s, r) for sid, s, r in candidates if sid == top_id],
+                    key=lambda t: abs(t[1] - median_score),
+                )[2]
+                # Overwrite the score field so the frontend sees the median
+                result = dict(result)
+                result["score"] = round(median_score, 4)
+            else:
+                # No frame produced a match — return the last denial result
+                result = last_result or {"status": "no_face", "access": "denied",
+                                         "message": "No face detected in any frame"}
 
         # Single-frame legacy path
         else:
@@ -118,8 +154,7 @@ def api_verify():
             if not payload:
                 return jsonify({"status": "error",
                                 "message": "image or images field is required"}), 400
-
-        result = verify_user(payload)
+            result = verify_user(payload)
         return jsonify(result)
 
     except Exception as e:
@@ -153,7 +188,7 @@ def api_detect():
         result = detect_face(image)
         return jsonify({
             "face_detected": result["face_detected"],
-            "bbox":          result["bbox"],
+            "bbox":          result.get("bbox"),   # None when no face — avoids KeyError
         })
 
     except Exception as e:

@@ -5,38 +5,39 @@
   Methods  : PCA (Eigenfaces)  &  LBP (Local Binary Patterns)
 =============================================================
 
-ROOT CAUSE FIX — Spatial Grid LBP
-----------------------------------
-The original lbp() computed a SINGLE 256-bin histogram over the entire
-face image.  This is a global descriptor: it captures WHAT textures exist
-but not WHERE they are.
+DESIGN NOTES
+------------
+PCA  – holistic / appearance-based method.
+       Known weakness  : sensitive to illumination variation.
+       Mitigation      : histogram-equalisation pre-processing
+                         + PCA fitted ONLY on enroll set (no data leakage).
 
-Consequence: any two frontal faces share the same statistical texture
-distribution (skin, edges around eyes/nose/mouth in similar proportions)
-so their global LBP cosine similarity is always 0.88-0.96 regardless of
-identity.  A threshold in that range is useless.
+LBP  – texture / local-feature method.
+       Uses relative pixel comparisons → inherently illumination-robust.
+       5x5 spatial grid (1475-dim uniform LBP) — identical to enrollment.py.
 
-Fix: spatial_lbp() divides the face into a GRID_H × GRID_W grid
-(default 7 × 7 = 49 cells) and computes a 256-bin LBP histogram per
-cell, then concatenates them into a 49 × 256 = 12 544-dim vector.
+FPIR / FNIR NOTE  (Open-Set Identification)
+--------------------------------------------
+Previous version used a closed-set split (all 40 subjects enrolled).
+This meant there were no true impostors, making FPIR trivially 0.
 
-The spatial layout encodes WHERE each texture appears:
-  - eye-region cells have high edge-code frequency
-  - nose-bridge cells have different orientation statistics
-  - cheek cells have mostly uniform codes
-Two different people have visually similar GLOBAL statistics but very
-different SPATIAL arrangements — the inter-person distance in the
-12 544-dim space is therefore much larger, giving genuine vs impostor
-distributions that are well-separated and amenable to thresholding.
+Fixed version uses an open-set split:
+  - 30 subjects (75%) → enrolled in gallery
+  - 10 subjects (25%) → held out as unknown impostors (never enrolled)
+  - Of each enrolled subject's 10 images:
+      60% → gallery  (enroll)
+      40% → genuine probes
 
-FPIR / FNIR NOTE  (unchanged from original)
--------------------------------------------
-Open-set identification setting; threshold calibrated on rank-1
-identification scores, NOT pairwise verification scores.
+FNIR = P(genuine probe rejected)   = rejected genuines  / total genuines
+FPIR = P(impostor probe accepted)  = accepted impostors  / total impostors
+
+Threshold theta is calibrated at EER on the combined genuine+impostor
+identification score distribution.
 """
 
 import cv2
 import numpy as np
+import json
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -47,13 +48,7 @@ from scipy.interpolate import interp1d
 import warnings
 warnings.filterwarnings('ignore')
 
-
-# =========================================================
-# GRID PARAMETERS  (shared with enrollment.py via import)
-# =========================================================
-GRID_H   = 7      # rows of cells
-GRID_W   = 7      # columns of cells
-IMG_SIZE = (100, 100)   # face is resized to this before any processing
+from enrollment import preprocess, lbp, IMG_SIZE
 
 
 # =========================================================
@@ -74,113 +69,70 @@ def load_dataset(path, size=IMG_SIZE):
 
 
 # =========================================================
-# PREPROCESSING — Histogram Equalisation
+# OPEN-SET SPLIT
+# 75% of subjects enrolled, 25% held out as unknown impostors
 # =========================================================
-def preprocess(img):
-    """Histogram equalisation — normalises illumination variation."""
-    return cv2.equalizeHist(img)
-
-
-# =========================================================
-# SPATIAL GRID LBP  — the core fix
-# =========================================================
-def _lbp_codes(img):
+def split_dataset_openset(images, labels, enroll_ratio=0.6, known_ratio=0.75):
     """
-    Raw 8-neighbour LBP code image (interior pixels only).
-    Returns an (H-2) × (W-2) uint8 array of LBP codes.
+    Open-set split:
+      - known_ratio  % of subjects  → enrolled (gallery)
+      - remaining    % of subjects  → unknown impostors (never enrolled)
+      - enroll_ratio % of known subject images → gallery
+      - rest of known images        → genuine probes
+
+    With ORL (40 subjects, 10 images each):
+      known_ratio=0.75  → 30 enrolled, 10 impostors
+      enroll_ratio=0.60 → 6 gallery images, 4 genuine probe images per subject
+
+    Returns
+    -------
+    enroll_idx   : indices into images/labels array for gallery
+    probe_idx    : indices for genuine probes  (known subjects, not in gallery)
+    impostor_idx : indices for impostor probes (unknown subjects, all images)
     """
-    c = img[1:-1, 1:-1]
-    code = (
-        ((img[0:-2, 0:-2] > c) << 7) |
-        ((img[0:-2, 1:-1] > c) << 6) |
-        ((img[0:-2, 2:]   > c) << 5) |
-        ((img[1:-1, 2:]   > c) << 4) |
-        ((img[2:,   2:]   > c) << 3) |
-        ((img[2:,   1:-1] > c) << 2) |
-        ((img[2:,   0:-2] > c) << 1) |
-        ((img[1:-1, 0:-2] > c))
-    )
-    return code.astype(np.uint8)
+    labels    = np.array(labels)
+    subjects  = np.unique(labels)
+    n_known   = max(1, int(len(subjects) * known_ratio))
 
+    known_subjects   = subjects[:n_known]
+    unknown_subjects = subjects[n_known:]
 
-def lbp(img, grid_h=GRID_H, grid_w=GRID_W):
-    """
-    Spatial grid LBP descriptor.
+    enroll_idx, probe_idx, impostor_idx = [], [], []
 
-    Divides the face into grid_h × grid_w cells and computes a
-    normalised 256-bin LBP histogram per cell, then concatenates
-    all cell histograms into a single (grid_h * grid_w * 256)-dim
-    feature vector.
-
-    WHY THIS FIXES THE FALSE-MATCH PROBLEM
-    ----------------------------------------
-    Global LBP: two different people → cosine sim 0.88-0.96 (no separation)
-    Spatial LBP: two different people → cosine sim 0.60-0.80
-                 same person (genuine) → cosine sim 0.85-0.97
-    The genuine/impostor distributions no longer overlap, so a threshold
-    at 0.82 gives <1% FAR with >95% TAR on ORL.
-
-    Args:
-        img:    grayscale numpy array, already resized to IMG_SIZE
-        grid_h: number of cell rows
-        grid_w: number of cell columns
-
-    Returns:
-        1-D float64 numpy array of length grid_h * grid_w * 256,
-        L2-normalised so cosine_sim == dot product.
-    """
-    codes  = _lbp_codes(img)           # (H-2) × (W-2)
-    H, W   = codes.shape
-    ch, cw = H // grid_h, W // grid_w # cell height / width in pixels
-
-    histograms = []
-    for r in range(grid_h):
-        for c in range(grid_w):
-            cell = codes[r * ch:(r + 1) * ch, c * cw:(c + 1) * cw]
-            hist, _ = np.histogram(cell.ravel(), bins=256, range=(0, 256))
-            norm = hist / (hist.sum() + 1e-10)
-            histograms.append(norm)
-
-    feat = np.concatenate(histograms)               # grid_h*grid_w*256 dims
-    feat = feat / (np.linalg.norm(feat) + 1e-10)   # L2-normalise → cosine = dot
-    return feat
-
-
-# =========================================================
-# SIMILARITY — cosine  (dot product on L2-normed vectors)
-# =========================================================
-def similarity(x, y):
-    """
-    Cosine similarity between two feature vectors.
-    Because lbp() returns L2-normalised vectors, this reduces to a
-    dot product (faster, numerically identical result).
-    """
-    return float(np.dot(x, y))
-
-
-# =========================================================
-# TRAIN / TEST SPLIT — 80 % enroll, 20 % probe (per subject)
-# =========================================================
-def split_dataset(images, labels):
-    labels = np.array(labels)
-    enroll_idx, probe_idx = [], []
-    for s in np.unique(labels):
+    for s in known_subjects:
         idx   = np.where(labels == s)[0]
-        split = max(1, int(0.8 * len(idx)))
+        split = max(1, int(enroll_ratio * len(idx)))
         enroll_idx.extend(idx[:split].tolist())
         probe_idx.extend(idx[split:].tolist())
-    return np.array(enroll_idx), np.array(probe_idx)
+
+    for s in unknown_subjects:
+        idx = np.where(labels == s)[0]
+        impostor_idx.extend(idx.tolist())
+
+    return (
+        np.array(enroll_idx),
+        np.array(probe_idx),
+        np.array(impostor_idx),
+    )
 
 
 # =========================================================
-# GEN-IMP SCORES  (pairwise verification — for ROC / EER)
+# SIMILARITY — cosine
+# =========================================================
+def similarity(x, y):
+    return np.dot(x, y) / (np.linalg.norm(x) * np.linalg.norm(y) + 1e-10)
+
+
+# =========================================================
+# GEN-IMP SCORES  (pairwise verification scores)
+# Used for ROC / AUC / EER / d' curves only.
 # =========================================================
 def gen_imp_scores(FM, labels, enroll_idx, probe_idx):
-    Gen, Imp = [], []
+    Gen, Imp   = [], []
     labels     = np.array(labels)
     enroll_lbl = labels[enroll_idx]
     probe_lbl  = labels[probe_idx]
-    unique     = np.unique(labels)
+    unique     = np.unique(labels[np.concatenate([enroll_idx, probe_idx])])
 
     for s in unique:
         e_idx = enroll_idx[enroll_lbl == s]
@@ -202,7 +154,7 @@ def gen_imp_scores(FM, labels, enroll_idx, probe_idx):
 
 
 # =========================================================
-# METRICS
+# METRICS  (EER, AUC, d', TMR@FMR)
 # =========================================================
 def compute_metrics(Gen, Imp):
     scores = np.concatenate([Gen, Imp])
@@ -235,51 +187,116 @@ def compute_metrics(Gen, Imp):
 
 
 # =========================================================
-# RANK-1
+# RANK-1 — Vectorised
 # =========================================================
 def rank1_acc(FM, labels, enroll_idx, probe_idx):
     labels = np.array(labels)
     FM_e   = FM[enroll_idx]
     FM_p   = FM[probe_idx]
-    # Already L2-normalised by lbp() — dot product == cosine sim
-    sim_matrix  = FM_p @ FM_e.T
+    norm_e = FM_e / (np.linalg.norm(FM_e, axis=1, keepdims=True) + 1e-10)
+    norm_p = FM_p / (np.linalg.norm(FM_p, axis=1, keepdims=True) + 1e-10)
+    sim_matrix  = norm_p @ norm_e.T
     pred_labels = labels[enroll_idx[np.argmax(sim_matrix, axis=1)]]
     return float(np.mean(pred_labels == labels[probe_idx]))
 
 
 # =========================================================
-# FPIR / FNIR  (Open-Set Identification)
+# OPEN-SET FPIR / FNIR
 # =========================================================
-def fpir_fnir(FM, labels, enroll_idx, probe_idx, _unused_threshold=None):
+def fpir_fnir_openset(FM, labels, enroll_idx, probe_idx, impostor_idx):
+    """
+    True open-set FPIR / FNIR.
+
+    Genuine probes  : known subjects with images NOT in gallery
+                      → system should accept them (score >= theta)
+    Impostor probes : unknown subjects never enrolled
+                      → system should reject ALL of them (score < theta)
+
+    FNIR = genuine probes rejected  / total genuine probes
+    FPIR = impostor probes accepted / total impostor probes
+
+    Threshold theta calibrated at EER on the combined identification
+    score distribution (genuine best-match scores vs impostor best-match
+    scores), NOT on pairwise verification scores.
+    """
     labels     = np.array(labels)
     enroll_lbl = labels[enroll_idx]
-    probe_lbl  = labels[probe_idx]
 
-    FM_e = FM[enroll_idx]
-    FM_p = FM[probe_idx]
-    sim  = FM_p @ FM_e.T      # dot product on L2-normed == cosine
+    FM_e   = FM[enroll_idx]
+    norm_e = FM_e / (np.linalg.norm(FM_e, axis=1, keepdims=True) + 1e-10)
 
-    best_col = np.argmax(sim, axis=1)
-    best_scr = sim[np.arange(len(probe_idx)), best_col]
-    pred_lbl = enroll_lbl[best_col]
-    correct  = (pred_lbl == probe_lbl)
+    def _best_match_scores(idx_set):
+        """Return (best_score, predicted_label) for each probe in idx_set."""
+        FM_p     = FM[idx_set]
+        norm_p   = FM_p / (np.linalg.norm(FM_p, axis=1, keepdims=True) + 1e-10)
+        sim      = norm_p @ norm_e.T
+        best_col = np.argmax(sim, axis=1)
+        best_scr = sim[np.arange(len(idx_set)), best_col]
+        pred_lbl = enroll_lbl[best_col]
+        return best_scr, pred_lbl
 
-    y_id_true = correct.astype(int)
+    # Genuine probes — known subjects, images not in gallery
+    gen_scores, gen_pred = _best_match_scores(probe_idx)
+    gen_correct          = (gen_pred == labels[probe_idx])
 
-    if y_id_true.sum() == 0 or y_id_true.sum() == len(y_id_true):
-        theta = float(np.median(best_scr))
+    # Impostor probes — unknown subjects, never enrolled
+    imp_scores, _        = _best_match_scores(impostor_idx)
+    # Impostors can never be "correct" — they have no gallery entry
+    imp_correct          = np.zeros(len(impostor_idx), dtype=bool)
+
+    # ── Calibrate threshold on identification scores ──────────────────
+    # y=1 → genuine correct match, y=0 → impostor (or misclassified genuine)
+    all_scores  = np.concatenate([gen_scores,              imp_scores])
+    all_correct = np.concatenate([gen_correct.astype(int), imp_correct.astype(int)])
+
+    if all_correct.sum() == 0 or all_correct.sum() == len(all_correct):
+        theta = float(np.median(all_scores))
     else:
-        fpr_id, tpr_id, thr_id = roc_curve(y_id_true, best_scr)
-        fnr_id  = 1.0 - tpr_id
-        eer_idx = np.argmin(np.abs(fnr_id - fpr_id))
-        theta   = float(thr_id[eer_idx])
+        fpr_c, tpr_c, thr_c = roc_curve(all_correct, all_scores)
+        fnr_c   = 1.0 - tpr_c
+        eer_idx = np.argmin(np.abs(fnr_c - fpr_c))
+        theta   = float(thr_c[eer_idx])
 
-    accepted = best_scr >= theta
-    n_genuine = len(probe_lbl)
-    fnir = float((~accepted).sum() / max(n_genuine, 1))
-    fpir = float((accepted & ~correct).sum() / max(n_genuine, 1))
+    # ── FNIR ─────────────────────────────────────────────────────────
+    gen_accepted = gen_scores >= theta
+    fnir = float((~gen_accepted).sum() / max(len(probe_idx), 1))
 
-    return fpir, fnir
+    # ── FPIR ─────────────────────────────────────────────────────────
+    imp_accepted = imp_scores >= theta
+    fpir = float(imp_accepted.sum() / max(len(impostor_idx), 1))
+
+    return fpir, fnir, theta
+
+
+# =========================================================
+# DET CURVE  (FPIR vs FNIR across all thresholds)
+# =========================================================
+def det_curve(FM, labels, enroll_idx, probe_idx, impostor_idx, n_points=300):
+    """
+    Sweep threshold 0→1 and record FPIR / FNIR at each point.
+    Returns arrays suitable for plotting a DET curve.
+    """
+    labels     = np.array(labels)
+    enroll_lbl = labels[enroll_idx]
+
+    FM_e   = FM[enroll_idx]
+    norm_e = FM_e / (np.linalg.norm(FM_e, axis=1, keepdims=True) + 1e-10)
+
+    def _scores(idx_set):
+        FM_p   = FM[idx_set]
+        norm_p = FM_p / (np.linalg.norm(FM_p, axis=1, keepdims=True) + 1e-10)
+        sim    = norm_p @ norm_e.T
+        best   = np.argmax(sim, axis=1)
+        return sim[np.arange(len(idx_set)), best]
+
+    gen_scores = _scores(probe_idx)
+    imp_scores = _scores(impostor_idx)
+
+    thresholds = np.linspace(0.0, 1.0, n_points)
+    fpirs = np.array([(imp_scores >= t).mean() for t in thresholds])
+    fnirs = np.array([(gen_scores <  t).mean() for t in thresholds])
+
+    return fpirs, fnirs, thresholds
 
 
 # =========================================================
@@ -290,15 +307,23 @@ def run_pipeline(dataset_path="dataset"):
     images_raw, labels = load_dataset(dataset_path)
     print(f"  Loaded {len(images_raw)} images from {len(np.unique(labels))} subjects")
 
-    print("Preprocessing (histogram equalisation)...")
+    print("Preprocessing (gamma + CLAHE + blur + oval mask)...")
     images = np.array([preprocess(img) for img in images_raw])
 
-    enroll_idx, probe_idx = split_dataset(images, labels)
-    print(f"  Enroll: {len(enroll_idx)} | Probe: {len(probe_idx)}")
+    # ── Open-set split ────────────────────────────────────────────────
+    enroll_idx, probe_idx, impostor_idx = split_dataset_openset(
+        images, labels,
+        enroll_ratio=0.60,   # 6 of 10 images per subject → gallery
+        known_ratio=0.75,    # 30 subjects enrolled, 10 unknowns → impostors
+    )
+    labels = np.array(labels)
+    print(f"  Enrolled subjects : {len(np.unique(labels[enroll_idx]))}")
+    print(f"  Genuine probes    : {len(probe_idx)}")
+    print(f"  Impostor probes   : {len(impostor_idx)}")
 
-    # ----------------------------------------------------------
+    # ------------------------------------------------------------------
     # METHOD 1 — PCA (Eigenfaces)
-    # ----------------------------------------------------------
+    # ------------------------------------------------------------------
     print("\nRunning PCA (Eigenfaces)...")
     X_all    = images.reshape(len(images), -1).astype(np.float32)
     X_enroll = X_all[enroll_idx]
@@ -307,47 +332,78 @@ def run_pipeline(dataset_path="dataset"):
     pca.fit(X_enroll)
     FM_pca = pca.transform(X_all)
 
-    Gen_pca, Imp_pca   = gen_imp_scores(FM_pca, labels, enroll_idx, probe_idx)
-    res_pca            = compute_metrics(Gen_pca, Imp_pca)
-    r1_pca             = rank1_acc(FM_pca, labels, enroll_idx, probe_idx)
-    fpir_pca, fnir_pca = fpir_fnir(FM_pca, labels, enroll_idx, probe_idx)
+    Gen_pca, Imp_pca              = gen_imp_scores(FM_pca, labels, enroll_idx, probe_idx)
+    res_pca                       = compute_metrics(Gen_pca, Imp_pca)
+    r1_pca                        = rank1_acc(FM_pca, labels, enroll_idx, probe_idx)
+    fpir_pca, fnir_pca, thr_pca  = fpir_fnir_openset(FM_pca, labels, enroll_idx, probe_idx, impostor_idx)
     res_pca.update(rank1=r1_pca, fpir=fpir_pca, fnir=fnir_pca)
 
     print(f"  EER={res_pca['eer']:.4f}  d'={res_pca['d_prime']:.4f}"
           f"  Rank-1={r1_pca:.4f}  AUC={res_pca['auc']:.4f}")
     print(f"  TMR@FMR=1%={res_pca['tmr_1']:.4f}  TMR@FMR=0.01%={res_pca['tmr_001']:.4f}")
-    print(f"  FPIR={fpir_pca:.4f}  FNIR={fnir_pca:.4f}")
+    print(f"  FPIR={fpir_pca:.4f}  FNIR={fnir_pca:.4f}  theta={thr_pca:.4f}")
 
-    # ----------------------------------------------------------
-    # METHOD 2 — Spatial Grid LBP
-    # ----------------------------------------------------------
-    print(f"\nRunning Spatial LBP ({GRID_H}×{GRID_W} grid, "
-          f"{GRID_H * GRID_W * 256}-dim descriptor)...")
+    # ------------------------------------------------------------------
+    # METHOD 2 — LBP (Local Binary Patterns)
+    # ------------------------------------------------------------------
+    print("\nRunning LBP...")
     FM_lbp = np.array([lbp(img) for img in images])
 
-    Gen_lbp, Imp_lbp   = gen_imp_scores(FM_lbp, labels, enroll_idx, probe_idx)
-    res_lbp            = compute_metrics(Gen_lbp, Imp_lbp)
-    r1_lbp             = rank1_acc(FM_lbp, labels, enroll_idx, probe_idx)
-    fpir_lbp, fnir_lbp = fpir_fnir(FM_lbp, labels, enroll_idx, probe_idx)
+    Gen_lbp, Imp_lbp              = gen_imp_scores(FM_lbp, labels, enroll_idx, probe_idx)
+    res_lbp                       = compute_metrics(Gen_lbp, Imp_lbp)
+    r1_lbp                        = rank1_acc(FM_lbp, labels, enroll_idx, probe_idx)
+    fpir_lbp, fnir_lbp, thr_lbp  = fpir_fnir_openset(FM_lbp, labels, enroll_idx, probe_idx, impostor_idx)
     res_lbp.update(rank1=r1_lbp, fpir=fpir_lbp, fnir=fnir_lbp)
 
     print(f"  EER={res_lbp['eer']:.4f}  d'={res_lbp['d_prime']:.4f}"
           f"  Rank-1={r1_lbp:.4f}  AUC={res_lbp['auc']:.4f}")
     print(f"  TMR@FMR=1%={res_lbp['tmr_1']:.4f}  TMR@FMR=0.01%={res_lbp['tmr_001']:.4f}")
-    print(f"  FPIR={fpir_lbp:.4f}  FNIR={fnir_lbp:.4f}")
+    print(f"  FPIR={fpir_lbp:.4f}  FNIR={fnir_lbp:.4f}  theta={thr_lbp:.4f}")
+
+    # ------------------------------------------------------------------
+    # CALIBRATED THRESHOLD RECOMMENDATIONS
+    # Thresholds are written to calibration.json so enrollment.py can
+    # load them automatically without manual copy-paste.
+    # ------------------------------------------------------------------
+    eer_thr           = res_lbp['eer_thr']
+    verify_threshold  = round(eer_thr - 0.02, 4)   # slightly below EER
+    dup_threshold     = round(eer_thr + 0.03, 4)   # slightly above EER
+
+    cal_path = Path("calibration.json")
+    calibration = {
+        "verify_threshold":    verify_threshold,
+        "duplicate_threshold": dup_threshold,
+        "lbp_eer_threshold":   round(eer_thr, 4),
+        "generated_from":      "ORL/AT&T dataset — LBP EER",
+    }
+    with open(cal_path, "w") as f:
+        json.dump(calibration, f, indent=2)
+
+    print("\n--- CALIBRATED THRESHOLDS (saved to calibration.json) ---")
+    print(f"  LBP EER threshold               : {eer_thr:.4f}")
+    print(f"  Suggested VERIFY_THRESHOLD      : {verify_threshold:.4f}")
+    print(f"  Suggested DUPLICATE_THRESHOLD   : {dup_threshold:.4f}")
+    print(f"  calibration.json written to     : {cal_path.resolve()}")
 
     out = Path("output")
     out.mkdir(parents=True, exist_ok=True)
 
-    # ----------------------------------------------------------
-    # DASHBOARD
-    # ----------------------------------------------------------
-    fig, axs = plt.subplots(2, 3, figsize=(16, 10))
+    # ------------------------------------------------------------------
+    # DET CURVES
+    # ------------------------------------------------------------------
+    fpirs_pca, fnirs_pca, _ = det_curve(FM_pca, labels, enroll_idx, probe_idx, impostor_idx)
+    fpirs_lbp, fnirs_lbp, _ = det_curve(FM_lbp, labels, enroll_idx, probe_idx, impostor_idx)
+
+    # ------------------------------------------------------------------
+    # DASHBOARD  (3 x 3 grid)
+    # ------------------------------------------------------------------
+    fig, axs = plt.subplots(3, 3, figsize=(18, 14))
     fig.suptitle(
-        f"Face Recognition — PCA vs Spatial LBP ({GRID_H}×{GRID_W})",
+        "Face Recognition — PCA vs LBP  (Open-Set Evaluation)",
         fontsize=14, fontweight="bold"
     )
 
+    # Row 0 — Gen/Imp distributions
     axs[0, 0].hist(Gen_pca, bins=50, alpha=0.6, label="Genuine",
                    density=True, color="steelblue")
     axs[0, 0].hist(Imp_pca, bins=50, alpha=0.6, label="Impostor",
@@ -355,83 +411,137 @@ def run_pipeline(dataset_path="dataset"):
     axs[0, 0].set_title("PCA — Gen/Imp Distribution")
     axs[0, 0].set_xlabel("Cosine Similarity")
     axs[0, 0].set_ylabel("Density")
-    axs[0, 0].legend()
-    axs[0, 0].grid(alpha=0.3)
+    axs[0, 0].legend(); axs[0, 0].grid(alpha=0.3)
 
     axs[0, 1].hist(Gen_lbp, bins=50, alpha=0.6, label="Genuine",
                    density=True, color="steelblue")
     axs[0, 1].hist(Imp_lbp, bins=50, alpha=0.6, label="Impostor",
                    density=True, color="darkorange")
-    axs[0, 1].set_title(f"Spatial LBP ({GRID_H}×{GRID_W}) — Gen/Imp Distribution")
+    axs[0, 1].set_title("LBP — Gen/Imp Distribution")
     axs[0, 1].set_xlabel("Cosine Similarity")
     axs[0, 1].set_ylabel("Density")
-    axs[0, 1].legend()
-    axs[0, 1].grid(alpha=0.3)
+    axs[0, 1].legend(); axs[0, 1].grid(alpha=0.3)
 
+    # Row 0 col 2 — ROC
     axs[0, 2].plot(res_pca['fpr'], res_pca['tpr'], linewidth=2,
                    label=f"PCA  (EER={res_pca['eer']:.3f})")
     axs[0, 2].plot(res_lbp['fpr'], res_lbp['tpr'], linewidth=2,
-                   label=f"Spatial LBP  (EER={res_lbp['eer']:.3f})")
+                   label=f"LBP  (EER={res_lbp['eer']:.3f})")
     axs[0, 2].plot([0, 1], [0, 1], "k--", linewidth=0.8)
-    axs[0, 2].set_title("ROC Curve")
+    axs[0, 2].set_title("ROC Curve (Verification)")
     axs[0, 2].set_xlabel("FMR (False Match Rate)")
     axs[0, 2].set_ylabel("TMR (True Match Rate)")
-    axs[0, 2].legend()
-    axs[0, 2].grid(True, alpha=0.3)
+    axs[0, 2].legend(); axs[0, 2].grid(True, alpha=0.3)
 
-    methods = ["PCA", f"Spatial LBP\n({GRID_H}×{GRID_W})"]
+    # Row 1 — DET curve + EER bar + d' bar
+    axs[1, 0].plot(fpirs_pca * 100, fnirs_pca * 100, linewidth=2,
+                   label=f"PCA  (FPIR={fpir_pca*100:.1f}%  FNIR={fnir_pca*100:.1f}%)")
+    axs[1, 0].plot(fpirs_lbp * 100, fnirs_lbp * 100, linewidth=2,
+                   label=f"LBP  (FPIR={fpir_lbp*100:.1f}%  FNIR={fnir_lbp*100:.1f}%)")
+    axs[1, 0].scatter([fpir_pca * 100], [fnir_pca * 100], zorder=5, s=80)
+    axs[1, 0].scatter([fpir_lbp * 100], [fnir_lbp * 100], zorder=5, s=80)
+    axs[1, 0].set_title("DET Curve — Open-Set  (EER operating point marked)")
+    axs[1, 0].set_xlabel("FPIR %  (False Positive Identification Rate)")
+    axs[1, 0].set_ylabel("FNIR %  (False Negative Identification Rate)")
+    axs[1, 0].legend(); axs[1, 0].grid(True, alpha=0.3)
+
+    methods = ["PCA", "LBP"]
     eers    = [res_pca['eer'], res_lbp['eer']]
-    bars    = axs[1, 0].bar(methods, eers,
+    bars    = axs[1, 1].bar(methods, eers,
                             color=["steelblue", "darkorange"], width=0.4)
-    axs[1, 0].set_title("EER Comparison (lower = better)")
-    axs[1, 0].set_ylabel("EER")
-    axs[1, 0].set_ylim(0, max(eers) * 1.3)
+    axs[1, 1].set_title("EER Comparison (lower = better)")
+    axs[1, 1].set_ylabel("EER")
+    axs[1, 1].set_ylim(0, max(eers) * 1.3)
     for bar, val in zip(bars, eers):
-        axs[1, 0].text(bar.get_x() + bar.get_width() / 2,
+        axs[1, 1].text(bar.get_x() + bar.get_width() / 2,
                        bar.get_height() + 0.002,
                        f"{val:.4f}", ha="center", va="bottom", fontweight="bold")
 
     dps  = [res_pca['d_prime'], res_lbp['d_prime']]
-    bars = axs[1, 1].bar(methods, dps,
+    bars = axs[1, 2].bar(methods, dps,
                          color=["steelblue", "darkorange"], width=0.4)
-    axs[1, 1].set_title("d-prime Comparison (higher = better)")
-    axs[1, 1].set_ylabel("d-prime")
-    axs[1, 1].set_ylim(0, max(dps) * 1.3)
+    axs[1, 2].set_title("d-prime Comparison (higher = better)")
+    axs[1, 2].set_ylabel("d-prime")
+    axs[1, 2].set_ylim(0, max(dps) * 1.3)
     for bar, val in zip(bars, dps):
-        axs[1, 1].text(bar.get_x() + bar.get_width() / 2,
+        axs[1, 2].text(bar.get_x() + bar.get_width() / 2,
                        bar.get_height() + 0.02,
                        f"{val:.4f}", ha="center", va="bottom", fontweight="bold")
 
-    axs[1, 2].axis("off")
+    # Row 2 — FPIR/FNIR bar + summary table + split info
+    x      = np.arange(2)
+    width  = 0.35
+    fpirs_ = [fpir_pca * 100, fpir_lbp * 100]
+    fnirs_ = [fnir_pca * 100, fnir_lbp * 100]
+    b1 = axs[2, 0].bar(x - width/2, fpirs_, width, label="FPIR %", color="crimson",   alpha=0.8)
+    b2 = axs[2, 0].bar(x + width/2, fnirs_, width, label="FNIR %", color="steelblue", alpha=0.8)
+    axs[2, 0].set_title("FPIR & FNIR @ EER threshold  (Open-Set)")
+    axs[2, 0].set_xticks(x); axs[2, 0].set_xticklabels(methods)
+    axs[2, 0].set_ylabel("%")
+    axs[2, 0].legend(); axs[2, 0].grid(axis="y", alpha=0.3)
+    for bar in list(b1) + list(b2):
+        axs[2, 0].text(bar.get_x() + bar.get_width() / 2,
+                       bar.get_height() + 0.3,
+                       f"{bar.get_height():.1f}%",
+                       ha="center", va="bottom", fontsize=8, fontweight="bold")
+
+    axs[2, 1].axis("off")
     rows = [
-        ["Metric",           "PCA",                             f"Spatial LBP"],
-        ["D-prime",          f"{res_pca['d_prime']:.3f}",       f"{res_lbp['d_prime']:.3f}"],
-        ["EER",              f"{res_pca['eer']*100:.2f}%",      f"{res_lbp['eer']*100:.2f}%"],
-        ["TMR @ FMR=1%",     f"{res_pca['tmr_1']*100:.2f}%",   f"{res_lbp['tmr_1']*100:.2f}%"],
-        ["TMR @ FMR=0.01%",  f"{res_pca['tmr_001']*100:.2f}%", f"{res_lbp['tmr_001']*100:.2f}%"],
-        ["AUC",              f"{res_pca['auc']:.4f}",           f"{res_lbp['auc']:.4f}"],
-        ["── BONUS ──",      "──────",                          "──────"],
-        ["Rank-1 (TPIR)",    f"{res_pca['rank1']*100:.2f}%",   f"{res_lbp['rank1']*100:.2f}%"],
-        ["FPIR @ ID-EER",    f"{res_pca['fpir']*100:.2f}%",    f"{res_lbp['fpir']*100:.2f}%"],
-        ["FNIR @ ID-EER",    f"{res_pca['fnir']*100:.2f}%",    f"{res_lbp['fnir']*100:.2f}%"],
+        ["Metric",           "PCA",                              "LBP"],
+        ["D-prime",          f"{res_pca['d_prime']:.3f}",        f"{res_lbp['d_prime']:.3f}"],
+        ["EER",              f"{res_pca['eer']*100:.2f}%",       f"{res_lbp['eer']*100:.2f}%"],
+        ["TMR @ FMR=1%",     f"{res_pca['tmr_1']*100:.2f}%",    f"{res_lbp['tmr_1']*100:.2f}%"],
+        ["TMR @ FMR=0.01%",  f"{res_pca['tmr_001']*100:.2f}%",  f"{res_lbp['tmr_001']*100:.2f}%"],
+        ["AUC",              f"{res_pca['auc']:.4f}",            f"{res_lbp['auc']:.4f}"],
+        ["── Open-Set ──",   "──────",                           "──────"],
+        ["Rank-1 (TPIR)",    f"{res_pca['rank1']*100:.2f}%",    f"{res_lbp['rank1']*100:.2f}%"],
+        ["FPIR @ EER",       f"{fpir_pca*100:.2f}%",            f"{fpir_lbp*100:.2f}%"],
+        ["FNIR @ EER",       f"{fnir_pca*100:.2f}%",            f"{fnir_lbp*100:.2f}%"],
+        ["ID Threshold",     f"{thr_pca:.4f}",                  f"{thr_lbp:.4f}"],
     ]
 
-    tbl = axs[1, 2].table(cellText=rows[1:], colLabels=rows[0],
+    tbl = axs[2, 1].table(cellText=rows[1:], colLabels=rows[0],
                           loc="center", cellLoc="center")
     tbl.auto_set_font_size(False)
     tbl.set_fontsize(9)
-    tbl.scale(1.15, 1.6)
-
+    tbl.scale(1.15, 1.5)
     for j in range(3):
         tbl[0, j].set_facecolor("#2c3e50")
         tbl[0, j].set_text_props(color="white", fontweight="bold")
     for j in range(3):
         tbl[7, j].set_facecolor("#ecf0f1")
         tbl[7, j].set_text_props(fontweight="bold", color="#7f8c8d")
+    axs[2, 1].set_title("All Metrics Summary")
 
-    axs[1, 2].set_title("All Metrics Summary")
+    axs[2, 2].axis("off")
+    split_info = (
+        f"Evaluation Protocol\n"
+        f"{'─'*32}\n"
+        f"Dataset     : ORL/AT&T\n"
+        f"Subjects    : {len(np.unique(labels))} total\n\n"
+        f"Enrolled    : {len(np.unique(labels[enroll_idx]))} subjects\n"
+        f"  Gallery   : {len(enroll_idx)} images\n\n"
+        f"Genuine probes\n"
+        f"  Subjects  : {len(np.unique(labels[probe_idx]))}\n"
+        f"  Images    : {len(probe_idx)}\n\n"
+        f"Impostor probes (unknown)\n"
+        f"  Subjects  : {len(np.unique(labels[impostor_idx]))}\n"
+        f"  Images    : {len(impostor_idx)}\n\n"
+        f"Thresholds @ EER\n"
+        f"  PCA       : {thr_pca:.4f}\n"
+        f"  LBP       : {thr_lbp:.4f}"
+    )
+    axs[2, 2].text(
+        0.05, 0.95, split_info,
+        transform=axs[2, 2].transAxes,
+        fontsize=9, verticalalignment="top",
+        fontfamily="monospace",
+        bbox=dict(boxstyle="round", facecolor="#f0f4f8", alpha=0.8),
+    )
+    axs[2, 2].set_title("Protocol Summary")
 
     plt.tight_layout()
+
     Path("static/images").mkdir(parents=True, exist_ok=True)
     for dest in [out / "final_dashboard.png", Path("static/images/results.png")]:
         plt.savefig(dest, dpi=150, bbox_inches="tight")
@@ -442,18 +552,31 @@ def run_pipeline(dataset_path="dataset"):
 
     return {
         "pca": {
-            "d_prime": res_pca['d_prime'], "eer": res_pca['eer'],
-            "tmr_1":   res_pca['tmr_1'],   "tmr_001": res_pca['tmr_001'],
-            "auc":     res_pca['auc'],      "rank1": res_pca['rank1'],
-            "fpir":    res_pca['fpir'],     "fnir": res_pca['fnir'],
+            "d_prime": res_pca['d_prime'],
+            "eer":     res_pca['eer'],
+            "tmr_1":   res_pca['tmr_1'],
+            "tmr_001": res_pca['tmr_001'],
+            "auc":     res_pca['auc'],
+            "rank1":   res_pca['rank1'],
+            "fpir":    fpir_pca,
+            "fnir":    fnir_pca,
         },
         "lbp": {
-            "d_prime": res_lbp['d_prime'], "eer": res_lbp['eer'],
-            "tmr_1":   res_lbp['tmr_1'],   "tmr_001": res_lbp['tmr_001'],
-            "auc":     res_lbp['auc'],      "rank1": res_lbp['rank1'],
-            "fpir":    res_lbp['fpir'],     "fnir": res_lbp['fnir'],
+            "d_prime": res_lbp['d_prime'],
+            "eer":     res_lbp['eer'],
+            "tmr_1":   res_lbp['tmr_1'],
+            "tmr_001": res_lbp['tmr_001'],
+            "auc":     res_lbp['auc'],
+            "rank1":   res_lbp['rank1'],
+            "fpir":    fpir_lbp,
+            "fnir":    fnir_lbp,
         },
         "plot_url": "/static/images/results.png",
+        "calibration": {
+            "lbp_eer_threshold":   round(eer_thr, 4),
+            "suggested_verify":    round(eer_thr - 0.02, 4),
+            "suggested_duplicate": round(eer_thr + 0.03, 4),
+        },
     }
 
 

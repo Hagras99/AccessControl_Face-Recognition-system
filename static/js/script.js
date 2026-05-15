@@ -399,6 +399,22 @@ function showDashboard(data, granted) {
         accessLabel.className = 'access-label denied';
         loginStatusBadge.textContent = 'Denied';
         loginStatusBadge.className = 'badge red';
+
+        // Show diagnostic score info so the user can see what happened
+        const score = data.best_score ?? data.score ?? null;
+        const thr   = data.threshold ?? null;
+        const reason = data.message  ?? '';
+        let debugMsg = reason;
+        if (score !== null) debugMsg += `  |  Score: ${(score*100).toFixed(1)}%`;
+        if (thr   !== null) debugMsg += `  |  Required: ${(thr*100).toFixed(1)}%`;
+        const existing = accessCard.querySelector('.deny-debug');
+        if (existing) existing.remove();
+        const dbg = document.createElement('p');
+        dbg.className = 'deny-debug';
+        dbg.style.cssText = 'font-size:0.8rem;opacity:0.7;margin-top:8px;font-family:monospace;';
+        dbg.textContent = debugMsg;
+        accessCard.appendChild(dbg);
+
         $('profileCard').classList.add('hidden');
     }
 }

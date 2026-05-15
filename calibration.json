@@ -1,0 +1,6 @@
+{
+  "verify_threshold": 0.878,
+  "duplicate_threshold": 0.928,
+  "lbp_eer_threshold": 0.898,
+  "generated_from": "ORL/AT&T dataset \u2014 LBP EER"
+}
