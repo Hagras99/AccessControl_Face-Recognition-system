@@ -3,74 +3,408 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Biometric Face Recognition</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
+    <title>FaceGuard — Biometric Access Control</title>
+    <meta name="description" content="Premium biometric face recognition access control system with real-time enrollment and verification">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
 </head>
 <body>
+    <!-- Animated Background -->
     <div class="background-shapes">
         <div class="shape shape-1"></div>
         <div class="shape shape-2"></div>
         <div class="shape shape-3"></div>
+        <div class="shape shape-4"></div>
     </div>
 
-    <main class="container">
-        <header class="header glass-panel">
-            <div class="header-content">
-                <div class="logo">
-                    <svg viewBox="0 0 24 24" width="32" height="32" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" class="icon"><path d="M3 7V5a2 2 0 0 1 2-2h2"></path><path d="M17 3h2a2 2 0 0 1 2 2v2"></path><path d="M21 17v2a2 2 0 0 1-2 2h-2"></path><path d="M7 21H5a2 2 0 0 1-2-2v-2"></path><path d="M8 14s1.5 2 4 2 4-2 4-2"></path><line x1="9" y1="9" x2="9.01" y2="9"></line><line x1="15" y1="9" x2="15.01" y2="9"></line></svg>
-                    <h1>Biometric Face Recognition</h1>
-                </div>
-                <p>ORL/AT&T Dataset • PCA vs LBP Evaluation</p>
-            </div>
-            <button id="startBtn" class="btn primary-btn">
-                <span class="btn-text">Start Evaluation</span>
-                <span class="loader hidden"></span>
-            </button>
-        </header>
+    <!-- Scanline overlay -->
+    <div class="scanline-overlay"></div>
 
-        <div id="loadingState" class="loading-container hidden">
-            <div class="spinner"></div>
-            <p>Processing images and extracting features... This may take a few seconds.</p>
-        </div>
+    <!-- Main App Container -->
+    <div id="app" class="app-container">
 
-        <div id="resultsContainer" class="results-grid hidden">
-            <!-- PCA Metrics Card -->
-            <div class="metric-card glass-panel fade-in delay-1">
-                <div class="card-header">
-                    <h2>PCA (Eigenfaces)</h2>
-                    <span class="badge blue">Primary</span>
+        <!-- Top Navigation Bar -->
+        <nav class="navbar glass-panel" id="navbar">
+            <div class="nav-brand">
+                <div class="brand-icon">
+                    <svg viewBox="0 0 24 24" width="28" height="28" stroke="currentColor" stroke-width="1.5" fill="none">
+                        <path d="M3 7V5a2 2 0 0 1 2-2h2"/>
+                        <path d="M17 3h2a2 2 0 0 1 2 2v2"/>
+                        <path d="M21 17v2a2 2 0 0 1-2 2h-2"/>
+                        <path d="M7 21H5a2 2 0 0 1-2-2v-2"/>
+                        <circle cx="12" cy="10" r="3"/>
+                        <path d="M7 20s1.5-3 5-3 5 3 5 3"/>
+                    </svg>
                 </div>
-                <div class="stats-grid" id="pcaStats">
-                    <!-- Dynamic stats will go here -->
+                <div class="brand-text">
+                    <span class="brand-name">FaceGuard</span>
+                    <span class="brand-sub">Biometric Access Control</span>
                 </div>
             </div>
 
-            <!-- LBP Metrics Card -->
-            <div class="metric-card glass-panel fade-in delay-2">
-                <div class="card-header">
-                    <h2>LBP (Local Binary Patterns)</h2>
-                    <span class="badge orange">Secondary</span>
-                </div>
-                <div class="stats-grid" id="lbpStats">
-                    <!-- Dynamic stats will go here -->
-                </div>
+            <div class="nav-tabs" id="navTabs">
+                <button class="nav-tab active" data-tab="enroll" id="tabBtnEnroll">
+                    <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none">
+                        <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/>
+                        <circle cx="9" cy="7" r="4"/>
+                        <line x1="19" y1="8" x2="19" y2="14"/>
+                        <line x1="22" y1="11" x2="16" y2="11"/>
+                    </svg>
+                    <span>Enroll</span>
+                </button>
+                <button class="nav-tab" data-tab="login" id="tabBtnLogin">
+                    <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none">
+                        <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+                        <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+                    </svg>
+                    <span>Login</span>
+                </button>
+                <button class="nav-tab" data-tab="evaluation" id="tabBtnEvaluation">
+                    <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none">
+                        <line x1="18" y1="20" x2="18" y2="10"/>
+                        <line x1="12" y1="20" x2="12" y2="4"/>
+                        <line x1="6" y1="20" x2="6" y2="14"/>
+                    </svg>
+                    <span>Evaluation</span>
+                </button>
+                <div class="tab-indicator" id="tabIndicator"></div>
             </div>
 
-            <!-- Plot Card -->
-            <div class="plot-card glass-panel fade-in delay-3">
-                <div class="card-header">
-                    <h2>Distributions & ROC Curve</h2>
+            <div class="nav-status">
+                <div class="status-dot" id="statusDot"></div>
+                <span class="status-text" id="statusText">Ready</span>
+            </div>
+        </nav>
+
+        <!-- ==================== ENROLL TAB ==================== -->
+        <section class="tab-content active" id="enrollTab">
+            <div class="enroll-layout">
+                <!-- Left: Webcam Feed -->
+                <div class="webcam-section glass-panel">
+                    <div class="section-header">
+                        <h2>Face Enrollment</h2>
+                        <span class="badge cyan" id="enrollPoseLabel">Pose 1/9</span>
+                    </div>
+
+                    <!-- Name Input -->
+                    <div class="input-group" id="nameInputGroup">
+                        <label for="enrollName">Your Name</label>
+                        <input type="text" id="enrollName" class="text-input" placeholder="Enter your full name..." autocomplete="off">
+                    </div>
+
+                    <!-- Webcam Container -->
+                    <div class="webcam-container" id="enrollWebcamContainer">
+                        <video id="enrollVideo" autoplay playsinline muted></video>
+                        <canvas id="enrollCanvas" class="hidden"></canvas>
+                        <!-- Face detection overlay -->
+                        <div class="face-overlay" id="enrollFaceOverlay">
+                            <div class="face-box" id="enrollFaceBox"></div>
+                        </div>
+                        <!-- Corner brackets -->
+                        <div class="scan-corners">
+                            <div class="corner tl"></div>
+                            <div class="corner tr"></div>
+                            <div class="corner bl"></div>
+                            <div class="corner br"></div>
+                        </div>
+                        <div class="webcam-placeholder" id="enrollPlaceholder">
+                            <svg viewBox="0 0 24 24" width="48" height="48" stroke="currentColor" stroke-width="1" fill="none" opacity="0.4">
+                                <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
+                                <circle cx="12" cy="13" r="4"/>
+                            </svg>
+                            <p>Camera will activate when you start enrollment</p>
+                        </div>
+                    </div>
+
+                    <!-- Pose Progress -->
+                    <div class="pose-progress" id="poseProgress">
+                        <div class="pose-dot captured" data-pose="0"><span>1</span></div>
+                        <div class="pose-dot" data-pose="1"><span>2</span></div>
+                        <div class="pose-dot" data-pose="2"><span>3</span></div>
+                        <div class="pose-dot" data-pose="3"><span>4</span></div>
+                        <div class="pose-dot" data-pose="4"><span>5</span></div>
+                        <div class="pose-dot" data-pose="5"><span>6</span></div>
+                        <div class="pose-dot" data-pose="6"><span>7</span></div>
+                        <div class="pose-dot" data-pose="7"><span>8</span></div>
+                        <div class="pose-dot" data-pose="8"><span>9</span></div>
+                    </div>
+
+                    <!-- Action Buttons -->
+                    <div class="action-bar">
+                        <button class="btn primary-btn" id="startEnrollBtn">
+                            <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none">
+                                <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
+                                <circle cx="12" cy="13" r="4"/>
+                            </svg>
+                            <span>Start Enrollment</span>
+                        </button>
+                        <button class="btn capture-btn hidden" id="captureBtn">
+                            <div class="capture-ring"></div>
+                            <span>Capture Pose</span>
+                        </button>
+                        <button class="btn ghost-btn hidden" id="resetEnrollBtn">
+                            <span>Reset</span>
+                        </button>
+                    </div>
+
+                    <!-- Status Messages -->
+                    <div class="enroll-status hidden" id="enrollStatus">
+                        <div class="status-icon" id="enrollStatusIcon"></div>
+                        <p id="enrollStatusMsg"></p>
+                    </div>
                 </div>
-                <div class="plot-image-container">
-                    <img id="resultsPlot" src="" alt="Results Plot" class="hidden">
-                    <div id="plotPlaceholder" class="placeholder">
-                        Plot will appear here after evaluation
+
+                <!-- Right: 3D Face Guide -->
+                <div class="guide-section glass-panel">
+                    <div class="section-header">
+                        <h2>Pose Guide</h2>
+                        <span class="badge purple">3D Preview</span>
+                    </div>
+
+                    <div class="face-guide-container" id="faceGuideContainer">
+                        <div class="face-guide-3d" id="faceGuide3D">
+                            <!-- SVG Wireframe Head -->
+                            <svg viewBox="0 0 200 250" class="head-svg" id="headSvg">
+                                <!-- Head outline -->
+                                <ellipse cx="100" cy="110" rx="70" ry="90" fill="none" stroke="url(#headGradient)" stroke-width="2" class="head-outline"/>
+                                <!-- Hair line -->
+                                <path d="M 35 85 Q 50 30, 100 25 Q 150 30, 165 85" fill="none" stroke="url(#headGradient)" stroke-width="1.5" opacity="0.5"/>
+                                <!-- Left eye -->
+                                <g class="eye left-eye" id="leftEye">
+                                    <ellipse cx="75" cy="100" rx="15" ry="8" fill="none" stroke="url(#eyeGradient)" stroke-width="1.5"/>
+                                    <circle cx="75" cy="100" r="4" fill="url(#eyeGradient)" class="pupil"/>
+                                </g>
+                                <!-- Right eye -->
+                                <g class="eye right-eye" id="rightEye">
+                                    <ellipse cx="125" cy="100" rx="15" ry="8" fill="none" stroke="url(#eyeGradient)" stroke-width="1.5"/>
+                                    <circle cx="125" cy="100" r="4" fill="url(#eyeGradient)" class="pupil"/>
+                                </g>
+                                <!-- Eyebrows -->
+                                <path d="M 58 88 Q 75 82, 92 88" fill="none" stroke="url(#headGradient)" stroke-width="1.5" class="brow left-brow"/>
+                                <path d="M 108 88 Q 125 82, 142 88" fill="none" stroke="url(#headGradient)" stroke-width="1.5" class="brow right-brow"/>
+                                <!-- Nose -->
+                                <path d="M 100 105 L 95 125 Q 100 130, 105 125 Z" fill="none" stroke="url(#headGradient)" stroke-width="1.2" class="nose"/>
+                                <!-- Mouth -->
+                                <path d="M 80 145 Q 100 155, 120 145" fill="none" stroke="url(#mouthGradient)" stroke-width="1.5" class="mouth" id="mouth"/>
+                                <!-- Ears -->
+                                <path d="M 30 95 Q 22 105, 30 120" fill="none" stroke="url(#headGradient)" stroke-width="1.2" class="ear left-ear"/>
+                                <path d="M 170 95 Q 178 105, 170 120" fill="none" stroke="url(#headGradient)" stroke-width="1.2" class="ear right-ear"/>
+                                <!-- Neck -->
+                                <line x1="85" y1="195" x2="85" y2="240" stroke="url(#headGradient)" stroke-width="1.5" opacity="0.4"/>
+                                <line x1="115" y1="195" x2="115" y2="240" stroke="url(#headGradient)" stroke-width="1.5" opacity="0.4"/>
+
+                                <!-- Gradients -->
+                                <defs>
+                                    <linearGradient id="headGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                                        <stop offset="0%" style="stop-color:#06b6d4;stop-opacity:0.9"/>
+                                        <stop offset="100%" style="stop-color:#8b5cf6;stop-opacity:0.9"/>
+                                    </linearGradient>
+                                    <linearGradient id="eyeGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                                        <stop offset="0%" style="stop-color:#22d3ee;stop-opacity:1"/>
+                                        <stop offset="100%" style="stop-color:#a78bfa;stop-opacity:1"/>
+                                    </linearGradient>
+                                    <linearGradient id="mouthGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+                                        <stop offset="0%" style="stop-color:#f472b6;stop-opacity:0.8"/>
+                                        <stop offset="100%" style="stop-color:#fb923c;stop-opacity:0.8"/>
+                                    </linearGradient>
+                                </defs>
+                            </svg>
+
+                            <!-- Direction Arrow -->
+                            <div class="direction-arrow hidden" id="directionArrow">
+                                <svg viewBox="0 0 24 24" width="40" height="40" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                                    <line x1="12" y1="19" x2="12" y2="5"/>
+                                    <polyline points="5 12 12 5 19 12"/>
+                                </svg>
+                            </div>
+                        </div>
+
+                        <!-- Pose Instruction -->
+                        <div class="pose-instruction" id="poseInstruction">
+                            <h3 id="poseTitle">Look Straight Ahead</h3>
+                            <p id="poseDescription">Position your face in the center of the frame</p>
+                        </div>
+                    </div>
+
+                    <!-- Captured Thumbnails -->
+                    <div class="captured-grid" id="capturedGrid">
+                        <h3>Captured Poses</h3>
+                        <div class="thumb-grid" id="thumbGrid"></div>
                     </div>
                 </div>
             </div>
-        </div>
-    </main>
+        </section>
+
+        <!-- ==================== LOGIN TAB ==================== -->
+        <section class="tab-content" id="loginTab">
+            <div class="login-layout">
+                <!-- Webcam Section -->
+                <div class="webcam-section glass-panel login-webcam-section">
+                    <div class="section-header">
+                        <h2>Face Verification</h2>
+                        <span class="badge green" id="loginStatusBadge">Standby</span>
+                    </div>
+
+                    <div class="webcam-container login-webcam" id="loginWebcamContainer">
+                        <video id="loginVideo" autoplay playsinline muted></video>
+                        <canvas id="loginCanvas" class="hidden"></canvas>
+                        <div class="face-overlay" id="loginFaceOverlay">
+                            <div class="face-box" id="loginFaceBox"></div>
+                        </div>
+                        <div class="scan-corners">
+                            <div class="corner tl"></div>
+                            <div class="corner tr"></div>
+                            <div class="corner bl"></div>
+                            <div class="corner br"></div>
+                        </div>
+                        <!-- Scanning animation -->
+                        <div class="scan-line hidden" id="scanLine"></div>
+                        <div class="webcam-placeholder" id="loginPlaceholder">
+                            <svg viewBox="0 0 24 24" width="48" height="48" stroke="currentColor" stroke-width="1" fill="none" opacity="0.4">
+                                <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+                                <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+                            </svg>
+                            <p>Click "Start Camera" to begin verification</p>
+                        </div>
+                    </div>
+
+                    <div class="action-bar">
+                        <button class="btn primary-btn" id="startLoginBtn">
+                            <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none">
+                                <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
+                                <circle cx="12" cy="13" r="4"/>
+                            </svg>
+                            <span>Start Camera</span>
+                        </button>
+                        <button class="btn accent-btn hidden" id="verifyBtn">
+                            <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none">
+                                <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
+                                <polyline points="22 4 12 14.01 9 11.01"/>
+                            </svg>
+                            <span>Verify Identity</span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Dashboard (hidden by default, shows on match) -->
+                <div class="dashboard-section hidden" id="dashboardSection">
+                    <!-- Access Result Card -->
+                    <div class="access-card glass-panel" id="accessCard">
+                        <div class="access-status" id="accessStatus">
+                            <div class="access-icon" id="accessIcon">
+                                <svg viewBox="0 0 24 24" width="64" height="64" stroke="currentColor" stroke-width="1.5" fill="none">
+                                    <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
+                                    <polyline points="22 4 12 14.01 9 11.01"/>
+                                </svg>
+                            </div>
+                            <h2 class="access-label" id="accessLabel">ACCESS GRANTED</h2>
+                        </div>
+                    </div>
+
+                    <!-- User Profile Card -->
+                    <div class="profile-card glass-panel" id="profileCard">
+                        <div class="profile-header">
+                            <div class="profile-avatar" id="profileAvatar">
+                                <img id="profileThumb" src="" alt="User">
+                            </div>
+                            <div class="profile-info">
+                                <h2 class="profile-name" id="profileName">—</h2>
+                                <span class="profile-id" id="profileId">—</span>
+                            </div>
+                        </div>
+                        <div class="profile-details">
+                            <div class="detail-item">
+                                <span class="detail-label">Match Confidence</span>
+                                <div class="confidence-bar">
+                                    <div class="confidence-fill" id="confidenceFill"></div>
+                                </div>
+                                <span class="detail-value" id="confidenceValue">—</span>
+                            </div>
+                            <div class="detail-item">
+                                <span class="detail-label">Enrolled</span>
+                                <span class="detail-value" id="enrolledDate">—</span>
+                            </div>
+                            <div class="detail-item">
+                                <span class="detail-label">Source</span>
+                                <span class="detail-value" id="profileSource">—</span>
+                            </div>
+                            <div class="detail-item">
+                                <span class="detail-label">Images on File</span>
+                                <span class="detail-value" id="profileImageCount">—</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <button class="btn ghost-btn" id="loginAgainBtn">
+                        <span>Verify Another Face</span>
+                    </button>
+                </div>
+            </div>
+        </section>
+
+        <!-- ==================== EVALUATION TAB ==================== -->
+        <section class="tab-content" id="evaluationTab">
+            <div class="eval-layout">
+                <div class="eval-header glass-panel">
+                    <div class="section-header">
+                        <div>
+                            <h2>PCA vs LBP Evaluation</h2>
+                            <p class="section-sub">ORL/AT&T Dataset • 40 Subjects • 400 Images</p>
+                        </div>
+                        <button id="startEvalBtn" class="btn primary-btn">
+                            <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none">
+                                <polygon points="5 3 19 12 5 21 5 3"/>
+                            </svg>
+                            <span class="eval-btn-text">Start Evaluation</span>
+                            <span class="loader hidden" id="evalLoader"></span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Loading -->
+                <div id="evalLoading" class="loading-container hidden">
+                    <div class="spinner"></div>
+                    <p>Processing images and extracting features...</p>
+                    <p class="loading-sub">Running PCA & LBP pipelines — this may take a few seconds</p>
+                </div>
+
+                <!-- Results -->
+                <div id="evalResults" class="results-grid hidden">
+                    <!-- PCA Card -->
+                    <div class="metric-card glass-panel fade-in delay-1">
+                        <div class="card-header">
+                            <h2>PCA (Eigenfaces)</h2>
+                            <span class="badge blue">Holistic</span>
+                        </div>
+                        <div class="stats-grid" id="pcaStats"></div>
+                    </div>
+
+                    <!-- LBP Card -->
+                    <div class="metric-card glass-panel fade-in delay-2">
+                        <div class="card-header">
+                            <h2>LBP (Local Binary Patterns)</h2>
+                            <span class="badge orange">Texture</span>
+                        </div>
+                        <div class="stats-grid" id="lbpStats"></div>
+                    </div>
+
+                    <!-- Plot -->
+                    <div class="plot-card glass-panel fade-in delay-3">
+                        <div class="card-header">
+                            <h2>Distributions, ROC & Metrics Dashboard</h2>
+                        </div>
+                        <div class="plot-image-container">
+                            <img id="resultsPlot" src="" alt="Results Dashboard" class="hidden">
+                            <div id="plotPlaceholder" class="placeholder">
+                                Dashboard will appear here after evaluation
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+    </div>
 
     <script src="{{ url_for('static', filename='js/script.js') }}"></script>
 </body>
