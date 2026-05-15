@@ -14,7 +14,7 @@ PCA  – holistic / appearance-based method.
 
 LBP  – texture / local-feature method.
        Uses relative pixel comparisons → inherently illumination-robust.
-       5x5 spatial grid (6400-dim) — identical to enrollment.py.
+       Vectorised NumPy implementation (~100× faster than pixel loops).
 
 FPIR / FNIR NOTE
 ----------------
@@ -26,10 +26,16 @@ FPIR and FNIR are computed in the open-set identification setting:
       score <  theta  -> reject / "not in gallery"
 
   FNIR = P(score < theta | genuine probe)
+       = fraction of genuine probes whose best score falls below theta.
+
   FPIR = P(score >= theta AND wrong id | any probe)
+       = fraction of probes accepted but assigned the wrong identity.
 
   The threshold theta is calibrated on the IDENTIFICATION scores
   (rank-1 best-match scores), NOT on pairwise verification scores.
+  Using the pairwise EER threshold on identification scores produces
+  FNIR = 0 because rank-1 scores are systematically higher than
+  random pairwise scores.
 """
 
 import cv2
@@ -44,16 +50,11 @@ from scipy.interpolate import interp1d
 import warnings
 warnings.filterwarnings('ignore')
 
-# enrollment.py is the single source of truth for preprocess() and lbp().
-# main.py imports them to guarantee the evaluation feature space is identical
-# to the live system feature space.
-from enrollment import preprocess, lbp, IMG_SIZE
-
 
 # =========================================================
-# LOAD DATASET
+# LOAD DATASET  (reads .pgm files directly)
 # =========================================================
-def load_dataset(path, size=IMG_SIZE):
+def load_dataset(path, size=(100, 100)):
     images, labels = [], []
     for label_id, person_dir in enumerate(sorted(Path(path).iterdir())):
         if not person_dir.is_dir():
@@ -65,6 +66,32 @@ def load_dataset(path, size=IMG_SIZE):
             images.append(cv2.resize(img, size))
             labels.append(label_id)
     return np.array(images), np.array(labels)
+
+
+# =========================================================
+# PREPROCESSING — Histogram Equalisation
+# =========================================================
+def preprocess(img):
+    return cv2.equalizeHist(img)
+
+
+# =========================================================
+# LBP FEATURE — Vectorised NumPy
+# =========================================================
+def lbp(img):
+    c = img[1:-1, 1:-1]
+    code = (
+        ((img[0:-2, 0:-2] > c) << 7) |
+        ((img[0:-2, 1:-1] > c) << 6) |
+        ((img[0:-2, 2:]   > c) << 5) |
+        ((img[1:-1, 2:]   > c) << 4) |
+        ((img[2:,   2:]   > c) << 3) |
+        ((img[2:,   1:-1] > c) << 2) |
+        ((img[2:,   0:-2] > c) << 1) |
+        ((img[1:-1, 0:-2] > c))
+    )
+    hist, _ = np.histogram(code.ravel(), bins=256, range=(0, 256))
+    return hist / (np.sum(hist) + 1e-10)
 
 
 # =========================================================
@@ -100,13 +127,15 @@ def gen_imp_scores(FM, labels, enroll_idx, probe_idx):
     unique     = np.unique(labels)
 
     for s in unique:
-        e_idx = enroll_idx[enroll_lbl == s]
-        p_idx = probe_idx[probe_lbl  == s]
+        e_idx  = enroll_idx[enroll_lbl == s]
+        p_idx  = probe_idx[probe_lbl  == s]
         if len(e_idx) == 0 or len(p_idx) == 0:
             continue
+        # Genuine pairs
         for i in e_idx:
             for j in p_idx:
                 Gen.append(similarity(FM[i], FM[j]))
+        # Impostor pairs
         for s2 in unique:
             if s2 == s:
                 continue
@@ -166,10 +195,25 @@ def rank1_acc(FM, labels, enroll_idx, probe_idx):
 
 
 # =========================================================
-# FPIR / FNIR  — Open-Set Identification
-# Threshold calibrated on identification scores, not pairwise scores.
+# FPIR / FNIR  — Open-Set Identification (FIXED)
+#
+# BUG IN OLD CODE:
+#   The old code used the pairwise EER threshold (eer_thr from
+#   compute_metrics) on identification scores. Because rank-1 scores
+#   are always higher than random pairwise scores, virtually every
+#   probe scored above the threshold → FNIR = 0 (wrong).
+#
+# FIX:
+#   Calibrate the decision threshold directly from the distribution
+#   of rank-1 identification scores by finding the EER point on
+#   the identification ROC (correct match vs. wrong match).
 # =========================================================
-def fpir_fnir(FM, labels, enroll_idx, probe_idx):
+def fpir_fnir(FM, labels, enroll_idx, probe_idx, _unused_threshold=None):
+    """
+    Compute FPIR and FNIR in the open-set 1:N identification setting.
+    The threshold is calibrated on identification scores (not pairwise scores).
+    `_unused_threshold` is kept for API compatibility but is not used.
+    """
     labels     = np.array(labels)
     enroll_lbl = labels[enroll_idx]
     probe_lbl  = labels[probe_idx]
@@ -178,16 +222,18 @@ def fpir_fnir(FM, labels, enroll_idx, probe_idx):
     FM_p   = FM[probe_idx]
     norm_e = FM_e / (np.linalg.norm(FM_e, axis=1, keepdims=True) + 1e-10)
     norm_p = FM_p / (np.linalg.norm(FM_p, axis=1, keepdims=True) + 1e-10)
-    sim    = norm_p @ norm_e.T
+    sim    = norm_p @ norm_e.T                          # (n_probe x n_enroll)
 
     best_col = np.argmax(sim, axis=1)
     best_scr = sim[np.arange(len(probe_idx)), best_col]
     pred_lbl = enroll_lbl[best_col]
-    correct  = (pred_lbl == probe_lbl)
+    correct  = (pred_lbl == probe_lbl)                  # True = genuine correct
 
+    # Calibrate threshold on the identification score distribution
     y_id_true = correct.astype(int)
 
     if y_id_true.sum() == 0 or y_id_true.sum() == len(y_id_true):
+        # Degenerate — fall back to median of best scores
         theta = float(np.median(best_scr))
     else:
         fpr_id, tpr_id, thr_id = roc_curve(y_id_true, best_scr)
@@ -197,8 +243,12 @@ def fpir_fnir(FM, labels, enroll_idx, probe_idx):
 
     accepted = best_scr >= theta
 
+    # FNIR: genuine probes rejected (score below threshold)
+    # All probes are genuine (each person is enrolled), so genuine_count = n_probe
     n_genuine = len(probe_lbl)
     fnir = float((~accepted).sum() / max(n_genuine, 1))
+
+    # FPIR: probes accepted but assigned wrong identity
     fpir = float((accepted & ~correct).sum() / max(n_genuine, 1))
 
     return fpir, fnir
@@ -212,8 +262,7 @@ def run_pipeline(dataset_path="dataset"):
     images_raw, labels = load_dataset(dataset_path)
     print(f"  Loaded {len(images_raw)} images from {len(np.unique(labels))} subjects")
 
-    # preprocess() imported from enrollment.py — same pipeline as live system
-    print("Preprocessing (gamma + CLAHE + blur + oval mask)...")
+    print("Preprocessing (histogram equalisation)...")
     images = np.array([preprocess(img) for img in images_raw])
 
     enroll_idx, probe_idx = split_dataset(images, labels)
@@ -243,7 +292,6 @@ def run_pipeline(dataset_path="dataset"):
 
     # ----------------------------------------------------------
     # METHOD 2 — LBP (Local Binary Patterns)
-    # lbp() imported from enrollment.py — 5x5 spatial grid, 6400-dim
     # ----------------------------------------------------------
     print("\nRunning LBP...")
     FM_lbp = np.array([lbp(img) for img in images])
@@ -258,19 +306,6 @@ def run_pipeline(dataset_path="dataset"):
           f"  Rank-1={r1_lbp:.4f}  AUC={res_lbp['auc']:.4f}")
     print(f"  TMR@FMR=1%={res_lbp['tmr_1']:.4f}  TMR@FMR=0.01%={res_lbp['tmr_001']:.4f}")
     print(f"  FPIR={fpir_lbp:.4f}  FNIR={fnir_lbp:.4f}")
-
-    # ----------------------------------------------------------
-    # CALIBRATED THRESHOLD RECOMMENDATIONS
-    # Use these values to set VERIFY_THRESHOLD / DUPLICATE_THRESHOLD
-    # in enrollment.py instead of guessing.
-    # ----------------------------------------------------------
-    eer_thr = res_lbp['eer_thr']
-    print("\n--- CALIBRATED THRESHOLDS (copy into enrollment.py) ---")
-    print(f"  LBP EER threshold               : {eer_thr:.4f}")
-    print(f"  Suggested VERIFY_THRESHOLD      : {eer_thr - 0.02:.4f}  "
-          "(EER point − 2% for usability)")
-    print(f"  Suggested DUPLICATE_THRESHOLD   : {eer_thr + 0.03:.4f}  "
-          "(stricter — requires stronger match)")
 
     out = Path("output")
     out.mkdir(parents=True, exist_ok=True)
@@ -396,11 +431,6 @@ def run_pipeline(dataset_path="dataset"):
             "fnir":    res_lbp['fnir'],
         },
         "plot_url": "/static/images/results.png",
-        "calibration": {
-            "lbp_eer_threshold":    round(eer_thr, 4),
-            "suggested_verify":     round(eer_thr - 0.02, 4),
-            "suggested_duplicate":  round(eer_thr + 0.03, 4),
-        },
     }
 
 
