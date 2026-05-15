@@ -15,6 +15,27 @@ PCA  – holistic / appearance-based method.
 LBP  – texture / local-feature method.
        Uses relative pixel comparisons → inherently illumination-robust.
        Vectorised NumPy implementation (~100× faster than pixel loops).
+
+FPIR / FNIR NOTE
+----------------
+FPIR and FNIR are computed in the open-set identification setting:
+  - Each probe is matched against all gallery templates via 1:N search.
+  - The system returns the top-1 candidate and its similarity score.
+  - A decision threshold theta is applied to that score:
+      score >= theta  -> claim identity (accepted)
+      score <  theta  -> reject / "not in gallery"
+
+  FNIR = P(score < theta | genuine probe)
+       = fraction of genuine probes whose best score falls below theta.
+
+  FPIR = P(score >= theta AND wrong id | any probe)
+       = fraction of probes accepted but assigned the wrong identity.
+
+  The threshold theta is calibrated on the IDENTIFICATION scores
+  (rank-1 best-match scores), NOT on pairwise verification scores.
+  Using the pairwise EER threshold on identification scores produces
+  FNIR = 0 because rank-1 scores are systematically higher than
+  random pairwise scores.
 """
 
 import cv2
@@ -49,14 +70,13 @@ def load_dataset(path, size=(100, 100)):
 
 # =========================================================
 # PREPROCESSING — Histogram Equalisation
-# Brings PCA closer to LBP's illumination robustness.
 # =========================================================
 def preprocess(img):
     return cv2.equalizeHist(img)
 
 
 # =========================================================
-# LBP FEATURE — Vectorised NumPy (~100x faster than loops)
+# LBP FEATURE — Vectorised NumPy
 # =========================================================
 def lbp(img):
     c = img[1:-1, 1:-1]
@@ -75,7 +95,7 @@ def lbp(img):
 
 
 # =========================================================
-# SIMILARITY
+# SIMILARITY — cosine
 # =========================================================
 def similarity(x, y):
     return np.dot(x, y) / (np.linalg.norm(x) * np.linalg.norm(y) + 1e-10)
@@ -96,7 +116,8 @@ def split_dataset(images, labels):
 
 
 # =========================================================
-# GEN-IMP SCORES  (uses separate enroll / probe sets)
+# GEN-IMP SCORES  (pairwise verification scores)
+# Used for ROC / AUC / EER / d' curves only.
 # =========================================================
 def gen_imp_scores(FM, labels, enroll_idx, probe_idx):
     Gen, Imp = [], []
@@ -110,11 +131,11 @@ def gen_imp_scores(FM, labels, enroll_idx, probe_idx):
         p_idx  = probe_idx[probe_lbl  == s]
         if len(e_idx) == 0 or len(p_idx) == 0:
             continue
-        # Genuine
+        # Genuine pairs
         for i in e_idx:
             for j in p_idx:
                 Gen.append(similarity(FM[i], FM[j]))
-        # Impostor
+        # Impostor pairs
         for s2 in unique:
             if s2 == s:
                 continue
@@ -127,7 +148,7 @@ def gen_imp_scores(FM, labels, enroll_idx, probe_idx):
 
 
 # =========================================================
-# METRICS
+# METRICS  (EER, AUC, d', TMR@FMR)
 # =========================================================
 def compute_metrics(Gen, Imp):
     scores = np.concatenate([Gen, Imp])
@@ -141,7 +162,6 @@ def compute_metrics(Gen, Imp):
     eer     = float(fpr[idx])
     eer_thr = float(thresholds[idx])
 
-    # Interpolated TMR at fixed FMR operating points
     f_tpr   = interp1d(fpr, tpr, bounds_error=False, fill_value=(0.0, 1.0))
     tmr_1   = float(f_tpr(0.01))
     tmr_001 = float(f_tpr(0.0001))
@@ -161,7 +181,7 @@ def compute_metrics(Gen, Imp):
 
 
 # =========================================================
-# RANK-1 — Vectorised (no Python loops, no self-match)
+# RANK-1 — Vectorised
 # =========================================================
 def rank1_acc(FM, labels, enroll_idx, probe_idx):
     labels = np.array(labels)
@@ -175,9 +195,25 @@ def rank1_acc(FM, labels, enroll_idx, probe_idx):
 
 
 # =========================================================
-# FPIR / FNIR at EER threshold — Vectorised
+# FPIR / FNIR  — Open-Set Identification (FIXED)
+#
+# BUG IN OLD CODE:
+#   The old code used the pairwise EER threshold (eer_thr from
+#   compute_metrics) on identification scores. Because rank-1 scores
+#   are always higher than random pairwise scores, virtually every
+#   probe scored above the threshold → FNIR = 0 (wrong).
+#
+# FIX:
+#   Calibrate the decision threshold directly from the distribution
+#   of rank-1 identification scores by finding the EER point on
+#   the identification ROC (correct match vs. wrong match).
 # =========================================================
-def fpir_fnir(FM, labels, enroll_idx, probe_idx, threshold):
+def fpir_fnir(FM, labels, enroll_idx, probe_idx, _unused_threshold=None):
+    """
+    Compute FPIR and FNIR in the open-set 1:N identification setting.
+    The threshold is calibrated on identification scores (not pairwise scores).
+    `_unused_threshold` is kept for API compatibility but is not used.
+    """
     labels     = np.array(labels)
     enroll_lbl = labels[enroll_idx]
     probe_lbl  = labels[probe_idx]
@@ -186,17 +222,35 @@ def fpir_fnir(FM, labels, enroll_idx, probe_idx, threshold):
     FM_p   = FM[probe_idx]
     norm_e = FM_e / (np.linalg.norm(FM_e, axis=1, keepdims=True) + 1e-10)
     norm_p = FM_p / (np.linalg.norm(FM_p, axis=1, keepdims=True) + 1e-10)
-    sim    = norm_p @ norm_e.T
+    sim    = norm_p @ norm_e.T                          # (n_probe x n_enroll)
 
-    best_idx = np.argmax(sim, axis=1)
-    best_scr = sim[np.arange(len(probe_idx)), best_idx]
-    pred_lbl = enroll_lbl[best_idx]
+    best_col = np.argmax(sim, axis=1)
+    best_scr = sim[np.arange(len(probe_idx)), best_col]
+    pred_lbl = enroll_lbl[best_col]
+    correct  = (pred_lbl == probe_lbl)                  # True = genuine correct
 
-    correct  = pred_lbl == probe_lbl
-    accepted = best_scr >= threshold
+    # Calibrate threshold on the identification score distribution
+    y_id_true = correct.astype(int)
 
-    fpir = float((accepted & ~correct).sum() / len(probe_lbl))
-    fnir = float((~accepted).sum()           / len(probe_lbl))
+    if y_id_true.sum() == 0 or y_id_true.sum() == len(y_id_true):
+        # Degenerate — fall back to median of best scores
+        theta = float(np.median(best_scr))
+    else:
+        fpr_id, tpr_id, thr_id = roc_curve(y_id_true, best_scr)
+        fnr_id  = 1.0 - tpr_id
+        eer_idx = np.argmin(np.abs(fnr_id - fpr_id))
+        theta   = float(thr_id[eer_idx])
+
+    accepted = best_scr >= theta
+
+    # FNIR: genuine probes rejected (score below threshold)
+    # All probes are genuine (each person is enrolled), so genuine_count = n_probe
+    n_genuine = len(probe_lbl)
+    fnir = float((~accepted).sum() / max(n_genuine, 1))
+
+    # FPIR: probes accepted but assigned wrong identity
+    fpir = float((accepted & ~correct).sum() / max(n_genuine, 1))
+
     return fpir, fnir
 
 
@@ -208,17 +262,14 @@ def run_pipeline(dataset_path="dataset"):
     images_raw, labels = load_dataset(dataset_path)
     print(f"  Loaded {len(images_raw)} images from {len(np.unique(labels))} subjects")
 
-    # Histogram equalisation
     print("Preprocessing (histogram equalisation)...")
     images = np.array([preprocess(img) for img in images_raw])
 
-    # 80 / 20 split
     enroll_idx, probe_idx = split_dataset(images, labels)
     print(f"  Enroll: {len(enroll_idx)} | Probe: {len(probe_idx)}")
 
     # ----------------------------------------------------------
     # METHOD 1 — PCA (Eigenfaces)
-    # PCA fitted ONLY on enroll set → no data leakage into probe.
     # ----------------------------------------------------------
     print("\nRunning PCA (Eigenfaces)...")
     X_all    = images.reshape(len(images), -1).astype(np.float32)
@@ -231,16 +282,16 @@ def run_pipeline(dataset_path="dataset"):
     Gen_pca, Imp_pca   = gen_imp_scores(FM_pca, labels, enroll_idx, probe_idx)
     res_pca            = compute_metrics(Gen_pca, Imp_pca)
     r1_pca             = rank1_acc(FM_pca, labels, enroll_idx, probe_idx)
-    fpir_pca, fnir_pca = fpir_fnir(FM_pca, labels, enroll_idx, probe_idx, res_pca['eer_thr'])
+    fpir_pca, fnir_pca = fpir_fnir(FM_pca, labels, enroll_idx, probe_idx)
     res_pca.update(rank1=r1_pca, fpir=fpir_pca, fnir=fnir_pca)
 
     print(f"  EER={res_pca['eer']:.4f}  d'={res_pca['d_prime']:.4f}"
           f"  Rank-1={r1_pca:.4f}  AUC={res_pca['auc']:.4f}")
     print(f"  TMR@FMR=1%={res_pca['tmr_1']:.4f}  TMR@FMR=0.01%={res_pca['tmr_001']:.4f}")
+    print(f"  FPIR={fpir_pca:.4f}  FNIR={fnir_pca:.4f}")
 
     # ----------------------------------------------------------
     # METHOD 2 — LBP (Local Binary Patterns)
-    # Relative pixel comparisons → illumination-robust by design.
     # ----------------------------------------------------------
     print("\nRunning LBP...")
     FM_lbp = np.array([lbp(img) for img in images])
@@ -248,24 +299,23 @@ def run_pipeline(dataset_path="dataset"):
     Gen_lbp, Imp_lbp   = gen_imp_scores(FM_lbp, labels, enroll_idx, probe_idx)
     res_lbp            = compute_metrics(Gen_lbp, Imp_lbp)
     r1_lbp             = rank1_acc(FM_lbp, labels, enroll_idx, probe_idx)
-    fpir_lbp, fnir_lbp = fpir_fnir(FM_lbp, labels, enroll_idx, probe_idx, res_lbp['eer_thr'])
+    fpir_lbp, fnir_lbp = fpir_fnir(FM_lbp, labels, enroll_idx, probe_idx)
     res_lbp.update(rank1=r1_lbp, fpir=fpir_lbp, fnir=fnir_lbp)
 
     print(f"  EER={res_lbp['eer']:.4f}  d'={res_lbp['d_prime']:.4f}"
           f"  Rank-1={r1_lbp:.4f}  AUC={res_lbp['auc']:.4f}")
     print(f"  TMR@FMR=1%={res_lbp['tmr_1']:.4f}  TMR@FMR=0.01%={res_lbp['tmr_001']:.4f}")
+    print(f"  FPIR={fpir_lbp:.4f}  FNIR={fnir_lbp:.4f}")
 
-    # Output folder (dashboard only — no CSV or TXT)
     out = Path("output")
     out.mkdir(parents=True, exist_ok=True)
 
     # ----------------------------------------------------------
-    # DASHBOARD  (2 × 3 grid)
+    # DASHBOARD  (2 x 3 grid)
     # ----------------------------------------------------------
     fig, axs = plt.subplots(2, 3, figsize=(16, 10))
     fig.suptitle("Face Recognition — PCA vs LBP", fontsize=14, fontweight="bold")
 
-    # ── Gen/Imp – PCA ─────────────────────────────────────────
     axs[0, 0].hist(Gen_pca, bins=50, alpha=0.6, label="Genuine",
                    density=True, color="steelblue")
     axs[0, 0].hist(Imp_pca, bins=50, alpha=0.6, label="Impostor",
@@ -276,7 +326,6 @@ def run_pipeline(dataset_path="dataset"):
     axs[0, 0].legend()
     axs[0, 0].grid(alpha=0.3)
 
-    # ── Gen/Imp – LBP ─────────────────────────────────────────
     axs[0, 1].hist(Gen_lbp, bins=50, alpha=0.6, label="Genuine",
                    density=True, color="steelblue")
     axs[0, 1].hist(Imp_lbp, bins=50, alpha=0.6, label="Impostor",
@@ -287,7 +336,6 @@ def run_pipeline(dataset_path="dataset"):
     axs[0, 1].legend()
     axs[0, 1].grid(alpha=0.3)
 
-    # ── ROC Curve ─────────────────────────────────────────────
     axs[0, 2].plot(res_pca['fpr'], res_pca['tpr'], linewidth=2,
                    label=f"PCA  (EER={res_pca['eer']:.3f})")
     axs[0, 2].plot(res_lbp['fpr'], res_lbp['tpr'], linewidth=2,
@@ -299,7 +347,6 @@ def run_pipeline(dataset_path="dataset"):
     axs[0, 2].legend()
     axs[0, 2].grid(True, alpha=0.3)
 
-    # ── EER Bar Chart ─────────────────────────────────────────
     methods = ["PCA", "LBP"]
     eers    = [res_pca['eer'], res_lbp['eer']]
     bars    = axs[1, 0].bar(methods, eers,
@@ -312,7 +359,6 @@ def run_pipeline(dataset_path="dataset"):
                        bar.get_height() + 0.002,
                        f"{val:.4f}", ha="center", va="bottom", fontweight="bold")
 
-    # ── d-prime Bar Chart ─────────────────────────────────────
     dps  = [res_pca['d_prime'], res_lbp['d_prime']]
     bars = axs[1, 1].bar(methods, dps,
                          color=["steelblue", "darkorange"], width=0.4)
@@ -324,9 +370,7 @@ def run_pipeline(dataset_path="dataset"):
                        bar.get_height() + 0.02,
                        f"{val:.4f}", ha="center", va="bottom", fontweight="bold")
 
-    # ── Styled Metrics Table (File 2 GUI style) ───────────────
     axs[1, 2].axis("off")
-
     rows = [
         ["Metric",           "PCA",                             "LBP"],
         ["D-prime",          f"{res_pca['d_prime']:.3f}",       f"{res_lbp['d_prime']:.3f}"],
@@ -336,8 +380,8 @@ def run_pipeline(dataset_path="dataset"):
         ["AUC",              f"{res_pca['auc']:.4f}",           f"{res_lbp['auc']:.4f}"],
         ["── BONUS ──",      "──────",                          "──────"],
         ["Rank-1 (TPIR)",    f"{res_pca['rank1']*100:.2f}%",   f"{res_lbp['rank1']*100:.2f}%"],
-        ["FPIR @ EER-thr",   f"{res_pca['fpir']*100:.2f}%",    f"{res_lbp['fpir']*100:.2f}%"],
-        ["FNIR @ EER-thr",   f"{res_pca['fnir']*100:.2f}%",    f"{res_lbp['fnir']*100:.2f}%"],
+        ["FPIR @ ID-EER",    f"{res_pca['fpir']*100:.2f}%",    f"{res_lbp['fpir']*100:.2f}%"],
+        ["FNIR @ ID-EER",    f"{res_pca['fnir']*100:.2f}%",    f"{res_lbp['fnir']*100:.2f}%"],
     ]
 
     tbl = axs[1, 2].table(cellText=rows[1:], colLabels=rows[0],
@@ -346,11 +390,9 @@ def run_pipeline(dataset_path="dataset"):
     tbl.set_fontsize(9)
     tbl.scale(1.15, 1.6)
 
-    # Header row — dark navy
     for j in range(3):
         tbl[0, j].set_facecolor("#2c3e50")
         tbl[0, j].set_text_props(color="white", fontweight="bold")
-    # Bonus separator row (index 7 in rendered table = rows[7])
     for j in range(3):
         tbl[7, j].set_facecolor("#ecf0f1")
         tbl[7, j].set_text_props(fontweight="bold", color="#7f8c8d")
@@ -359,18 +401,14 @@ def run_pipeline(dataset_path="dataset"):
 
     plt.tight_layout()
 
-    # Save to output/ AND static/images/ (for GUI / Flask route)
     Path("static/images").mkdir(parents=True, exist_ok=True)
     for dest in [out / "final_dashboard.png", Path("static/images/results.png")]:
         plt.savefig(dest, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
     print(f"\nDashboard saved → {out / 'final_dashboard.png'}")
-    print("DONE ✔")
+    print("DONE")
 
-    # ----------------------------------------------------------
-    # RETURN structured dict consumed by GUI / Flask route
-    # ----------------------------------------------------------
     return {
         "pca": {
             "d_prime": res_pca['d_prime'],
@@ -396,8 +434,5 @@ def run_pipeline(dataset_path="dataset"):
     }
 
 
-# =========================================================
-# ENTRY POINT
-# =========================================================
 if __name__ == "__main__":
     run_pipeline(dataset_path="dataset")

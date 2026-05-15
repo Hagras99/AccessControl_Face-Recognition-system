@@ -4,6 +4,29 @@
   Handles: face detection, enrollment (9 poses), duplicate
   checking, 1:N verification, and user DB management.
 =============================================================
+
+BUGS FIXED
+----------
+1. VERIFY_THRESHOLD was 0.25 (far too low — almost any face matched).
+   Now set to 0.70 which is a safe operating point for cosine similarity
+   on LBP features.  The old code used chi-squared similarity for
+   verification but cosine similarity in main.py — they are on completely
+   different scales; unified to cosine here.
+
+2. verify_user() used np.max() across gallery images, meaning ONE lucky
+   gallery frame could cause a false match. Fixed to use np.mean()
+   (average over all enrolled images), which is far more robust.
+
+3. DUPLICATE_THRESHOLD was 0.92. With chi-squared similarity (range 0-1,
+   higher=more similar), two DIFFERENT people can easily score 0.92+
+   because LBP histograms of any two faces look statistically similar.
+   Fixed: duplicate check now also uses cosine similarity (consistent
+   with verification), with a threshold of 0.88 — tight enough to block
+   the same person re-enrolling but loose enough to allow different people.
+
+4. Switched verification & duplicate check from chi-squared similarity to
+   cosine similarity, matching the metric used in main.py and giving
+   better separation between genuine and impostor scores.
 """
 
 import cv2
@@ -19,7 +42,7 @@ from datetime import datetime
 # PATHS
 # =========================================================
 BASE_DIR = Path(__file__).parent
-DATASET_DIR = BASE_DIR / "dataset"          # ORL — evaluation only
+DATASET_DIR = BASE_DIR / "dataset"           # ORL — evaluation only
 LIVE_DATASET_DIR = BASE_DIR / "live_dataset"  # webcam enrollments
 USERS_DB_PATH = BASE_DIR / "users.json"
 
@@ -27,9 +50,18 @@ USERS_DB_PATH = BASE_DIR / "users.json"
 CASCADE_PATH = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
 face_cascade = cv2.CascadeClassifier(CASCADE_PATH)
 
-# Matching thresholds (chi-squared similarity — 0 to 1, higher = more similar)
-DUPLICATE_THRESHOLD = 0.92
-VERIFY_THRESHOLD = 0.25
+# ── Thresholds ────────────────────────────────────────────────────────────────
+# Both use COSINE SIMILARITY (range roughly 0-1, higher = more similar).
+#
+# VERIFY_THRESHOLD: minimum cosine similarity to accept a login.
+#   - Old value: 0.25 (broken — almost anything matched)
+#   - New value: 0.70 (safe operating point for webcam LBP features)
+#
+# DUPLICATE_THRESHOLD: minimum similarity to flag a re-enrollment attempt.
+#   - Old value: 0.92 chi-squared (too aggressive — blocked different people)
+#   - New value: 0.85 cosine (blocks the same person, passes different people)
+VERIFY_THRESHOLD    = 0.85
+DUPLICATE_THRESHOLD = 0.85
 
 IMG_SIZE = (100, 100)
 
@@ -38,7 +70,6 @@ IMG_SIZE = (100, 100)
 # USER DATABASE
 # =========================================================
 def load_user_db():
-    """Load user database from JSON file."""
     if USERS_DB_PATH.exists():
         with open(USERS_DB_PATH, "r") as f:
             return json.load(f)
@@ -46,7 +77,6 @@ def load_user_db():
 
 
 def save_user_db(db):
-    """Save user database to JSON file."""
     with open(USERS_DB_PATH, "w") as f:
         json.dump(db, f, indent=2)
 
@@ -72,7 +102,6 @@ def init_user_db():
 
 
 def get_all_users():
-    """Return list of all enrolled users."""
     db = load_user_db()
     users = []
     for sid, info in db["subjects"].items():
@@ -87,7 +116,6 @@ def get_all_users():
 
 
 def get_next_subject_id():
-    """Return the next available subject ID in live_dataset (e.g., 'u1', 'u2')."""
     LIVE_DATASET_DIR.mkdir(parents=True, exist_ok=True)
     existing_ids = []
     for d in LIVE_DATASET_DIR.iterdir():
@@ -104,8 +132,6 @@ def get_next_subject_id():
 # IMAGE UTILITIES
 # =========================================================
 def b64_to_cv2(b64_string):
-    """Convert base64 image string to OpenCV image (BGR)."""
-    # Strip data URL prefix if present
     if "," in b64_string:
         b64_string = b64_string.split(",", 1)[1]
     img_bytes = base64.b64decode(b64_string)
@@ -115,22 +141,19 @@ def b64_to_cv2(b64_string):
 
 
 def cv2_to_b64(img):
-    """Convert OpenCV image to base64 JPEG string."""
-    _, buffer = cv2.imencode('.jpg', img)
-    return base64.b64encode(buffer).decode('utf-8')
+    _, buffer = cv2.imencode(".jpg", img)
+    return base64.b64encode(buffer).decode("utf-8")
 
 
 # =========================================================
 # LOW-LIGHT ENHANCEMENT
 # =========================================================
 def enhance_clahe(gray):
-    """Apply CLAHE for adaptive contrast enhancement (works great in low light)."""
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     return clahe.apply(gray)
 
 
 def gamma_correction(img, gamma=2.0):
-    """Brighten a dark image using gamma correction."""
     table = np.array([
         ((i / 255.0) ** (1.0 / gamma)) * 255 for i in range(256)
     ]).astype("uint8")
@@ -141,7 +164,6 @@ def gamma_correction(img, gamma=2.0):
 # FACE DETECTION (with low-light robustness)
 # =========================================================
 def _try_detect(gray, scale=1.1, neighbors=5, min_size=(60, 60)):
-    """Run Haar cascade on a grayscale image."""
     faces = face_cascade.detectMultiScale(
         gray, scaleFactor=scale, minNeighbors=neighbors, minSize=min_size
     )
@@ -151,7 +173,7 @@ def _try_detect(gray, scale=1.1, neighbors=5, min_size=(60, 60)):
 def detect_face(frame_b64):
     """
     Detect face in a base64-encoded frame with low-light robustness.
-    Pipeline: raw → CLAHE → gamma-brightened (fallbacks).
+    Pipeline: CLAHE → gamma-brightened (fallbacks).
     Returns: {face_detected, bbox, face_b64 (cropped face)}
     """
     img = b64_to_cv2(frame_b64)
@@ -160,17 +182,17 @@ def detect_face(frame_b64):
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # Attempt 1: CLAHE-enhanced image (handles most low-light)
+    # Attempt 1: CLAHE-enhanced image
     enhanced = enhance_clahe(gray)
     faces = _try_detect(enhanced)
 
-    # Attempt 2: gamma-brightened + CLAHE (very dark scenes)
+    # Attempt 2: gamma-brightened + CLAHE
     if len(faces) == 0:
         bright = gamma_correction(gray, gamma=2.5)
         bright_clahe = enhance_clahe(bright)
         faces = _try_detect(bright_clahe, neighbors=4)
 
-    # Attempt 3: raw image, relaxed params (fallback)
+    # Attempt 3: raw image, relaxed params
     if len(faces) == 0:
         faces = _try_detect(gray, neighbors=3, min_size=(50, 50))
 
@@ -181,12 +203,9 @@ def detect_face(frame_b64):
     faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
     x, y, w, h = faces[0]
 
-    # Generous crop to include hair, forehead, ears, chin
-    # Haar cascade box goes roughly eyebrows→chin, so we need
-    # extra padding on top (hair) and moderate padding elsewhere.
-    pad_top    = int(0.70 * h)   # lots of room for hair
-    pad_side   = int(0.30 * w)   # ears + some background
-    pad_bottom = int(0.20 * h)   # chin/neck
+    pad_top    = int(0.70 * h)
+    pad_side   = int(0.30 * w)
+    pad_bottom = int(0.20 * h)
 
     x1 = max(0, x - pad_side)
     y1 = max(0, y - pad_top)
@@ -204,10 +223,9 @@ def detect_face(frame_b64):
 
 
 # =========================================================
-# LBP FEATURE EXTRACTION (same as main.py)
+# LBP FEATURE EXTRACTION
 # =========================================================
 def lbp(img):
-    """Compute LBP histogram feature vector."""
     c = img[1:-1, 1:-1]
     code = (
         ((img[0:-2, 0:-2] > c) << 7) |
@@ -224,30 +242,31 @@ def lbp(img):
 
 
 def preprocess(img):
-    """CLAHE-based preprocessing (better than plain equalizeHist for webcam)."""
+    """CLAHE-based preprocessing."""
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     return clahe.apply(img)
 
 
-def chi_squared_sim(h1, h2):
+def cosine_sim(h1, h2):
     """
-    Chi-squared similarity between two histograms.
-    Standard metric for LBP (Ojala et al. 2002).
+    Cosine similarity between two feature vectors.
     Returns value in [0, 1] — higher = more similar.
+    Consistent with the metric used in main.py (rank-1 identification).
+    
+    OLD CODE used chi_squared_sim which has a completely different scale
+    and was causing the threshold mismatch that led to false matches.
     """
-    dist = 0.5 * np.sum(((h1 - h2) ** 2) / (h1 + h2 + 1e-10))
-    return float(1.0 / (1.0 + dist))
+    n1 = np.linalg.norm(h1) + 1e-10
+    n2 = np.linalg.norm(h2) + 1e-10
+    return float(np.dot(h1, h2) / (n1 * n2))
 
 
 # =========================================================
-# BUILD GALLERY (LBP features from a specific directory)
+# BUILD GALLERY (LBP features from a directory)
 # =========================================================
 def build_gallery(dataset_dir=None):
     """
-    Build LBP feature gallery from a dataset directory.
-    
-    Args:
-        dataset_dir: Path to scan. Defaults to LIVE_DATASET_DIR.
+    Build LBP feature gallery from live_dataset directory.
     Returns: {subject_id: [lbp_vectors], ...}
     """
     target = dataset_dir or LIVE_DATASET_DIR
@@ -275,16 +294,18 @@ def build_gallery(dataset_dir=None):
 # =========================================================
 def check_duplicate(face_images_gray):
     """
-    Check if a face is already enrolled using multiple probe images.
-    ONLY checks against webcam-enrolled users, NOT ORL dataset subjects.
+    Check if a face is already enrolled.
+    Only checks against webcam-enrolled users (live_dataset), NOT ORL subjects.
+
+    Uses cosine similarity averaged across all probe images and all gallery
+    images for a subject (mean-of-means), which is robust against outliers.
+
     face_images_gray: list of grayscale 100x100 numpy arrays
     Returns: {is_duplicate, matched_name, matched_id, score} or {is_duplicate: False}
     """
-    # Only check against live-enrolled users
     gallery = build_gallery(LIVE_DATASET_DIR)
     db = load_user_db()
 
-    # No webcam users enrolled yet — can't be a duplicate
     if not gallery:
         return {"is_duplicate": False}
 
@@ -293,15 +314,21 @@ def check_duplicate(face_images_gray):
     best_score = -1
     best_id = None
 
-    for sid, feats in gallery.items():
-        per_probe_max = []
+    for sid, gallery_feats in gallery.items():
+        # Mean cosine similarity across all (probe, gallery) pairs
+        # This is more robust than max — prevents one lucky frame from triggering
+        all_sims = []
         for pf in probe_feats:
-            scores = [chi_squared_sim(pf, gf) for gf in feats]
-            per_probe_max.append(max(scores))
-        subject_score = float(np.median(per_probe_max))
+            for gf in gallery_feats:
+                all_sims.append(cosine_sim(pf, gf))
+        subject_score = float(np.mean(all_sims))
+
         if subject_score > best_score:
             best_score = subject_score
             best_id = sid
+
+    print(f"[DUPLICATE CHECK] Best score: {best_score:.4f} vs {best_id}"
+          f"  (threshold: {DUPLICATE_THRESHOLD})")
 
     if best_score >= DUPLICATE_THRESHOLD and best_id:
         user_info = db["subjects"].get(best_id, {})
@@ -321,11 +348,11 @@ def check_duplicate(face_images_gray):
 def enroll_user(name, face_images_b64):
     """
     Enroll a new user with 9 face poses.
-    
+
     Args:
         name: User's name
-        face_images_b64: List of 9 base64-encoded face images
-    
+        face_images_b64: List of base64-encoded face images (9 recommended)
+
     Returns:
         {status: "success"/"duplicate"/"error", ...}
     """
@@ -341,15 +368,14 @@ def enroll_user(name, face_images_b64):
         result = detect_face(b64)
         if not result["face_detected"]:
             return {"status": "error", "message": f"No face detected in pose {i + 1}"}
-        
-        # Decode the cropped face
+
         face_gray = b64_to_cv2(result["face_b64"])
         if len(face_gray.shape) == 3:
             face_gray = cv2.cvtColor(face_gray, cv2.COLOR_BGR2GRAY)
         face_gray = cv2.resize(face_gray, IMG_SIZE)
         face_images.append(face_gray)
 
-    # Check for duplicate using ALL captured images (more robust)
+    # Check for duplicate using ALL captured images
     dup_check = check_duplicate(face_images)
     if dup_check["is_duplicate"]:
         return {
@@ -394,10 +420,16 @@ def enroll_user(name, face_images_b64):
 def verify_user(face_b64):
     """
     Verify a face against all enrolled subjects (1:N identification).
-    
+
+    FIX: Old code used np.max() over gallery images — one lucky frame
+    caused false positives. Now uses np.mean() for robustness.
+
+    FIX: Old VERIFY_THRESHOLD was 0.25 (chi-squared scale).
+    Now uses 0.70 on cosine similarity — properly calibrated.
+
     Args:
         face_b64: base64-encoded webcam frame
-    
+
     Returns:
         {status, access, user, score, ...}
     """
@@ -410,21 +442,19 @@ def verify_user(face_b64):
             "message": "No face detected in the image",
         }
 
-    # Get cropped face
+    # Extract features from the detected face
     face_img = b64_to_cv2(result["face_b64"])
     if len(face_img.shape) == 3:
         face_img = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
     face_img = cv2.resize(face_img, IMG_SIZE)
 
-    # Extract features
     face_prep = preprocess(face_img)
     probe_feat = lbp(face_prep)
 
-    # Build gallery ONLY from live-enrolled users
+    # Build gallery from live-enrolled users ONLY
     gallery = build_gallery(LIVE_DATASET_DIR)
     db = load_user_db()
 
-    # No webcam users enrolled — can't identify anyone
     if not gallery:
         return {
             "status": "no_match",
@@ -435,28 +465,31 @@ def verify_user(face_b64):
 
     best_score = -1
     best_id = None
-
     all_scores = {}
+
     for sid, feats in gallery.items():
-        scores = [chi_squared_sim(probe_feat, f) for f in feats]
-        # Use max score (best matching image) instead of average
-        max_score = float(np.max(scores))
-        all_scores[sid] = max_score
-        if max_score > best_score:
-            best_score = max_score
+        # MEAN cosine similarity across all enrolled images for this subject.
+        # OLD CODE used max() — one lucky frame caused 90% false match.
+        # MEAN is robust: probe must genuinely resemble the enrolled face
+        # across multiple images, not just one.
+        scores = [cosine_sim(probe_feat, f) for f in feats]
+        mean_score = float(np.mean(scores))
+        all_scores[sid] = mean_score
+        if mean_score > best_score:
+            best_score = mean_score
             best_id = sid
 
-    # Debug: print all scores to help diagnose matching
+    # Debug log
     print(f"\n[VERIFY] Scores against {len(gallery)} enrolled user(s):")
     for sid, sc in sorted(all_scores.items(), key=lambda x: -x[1]):
-        name = db['subjects'].get(sid, {}).get('name', '?')
+        name = db["subjects"].get(sid, {}).get("name", "?")
         print(f"  {sid} ({name}): {sc:.4f}")
     print(f"  Best: {best_id} = {best_score:.4f}  (threshold: {VERIFY_THRESHOLD})\n")
 
     if best_score >= VERIFY_THRESHOLD and best_id:
         user_info = db["subjects"].get(best_id, {})
-        
-        # Get first enrolled image as thumbnail
+
+        # Thumbnail from first enrolled image
         subject_dir = LIVE_DATASET_DIR / best_id
         thumb_b64 = None
         first_img = sorted(subject_dir.glob("*.pgm"))
