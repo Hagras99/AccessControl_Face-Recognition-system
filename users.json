@@ -239,6 +239,12 @@
       "enrolled_date": null,
       "source": "ORL",
       "image_count": 10
+    },
+    "u1": {
+      "name": "karim",
+      "enrolled_date": "2026-05-15T23:07:11.323186",
+      "source": "webcam",
+      "image_count": 9
     }
   }
 }
